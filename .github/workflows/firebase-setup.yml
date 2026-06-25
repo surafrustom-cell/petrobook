@@ -1,0 +1,46 @@
+name: Initialize Firebase (Run Once)
+
+# ── Run manually from GitHub Actions tab ────────────────────────────────────
+# This workflow creates the super_owner Firebase Auth account and sets all
+# required custom claims.  Run it once after the repo is deployed.
+#
+# NEVER re-run this if the user already exists -- the script handles idempotency.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  init_firebase:
+    name: Create super_owner + set custom claims
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # google-github-actions/auth writes the service account JSON to a temp
+      # file and exports GOOGLE_APPLICATION_CREDENTIALS for all later steps.
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+
+      - name: Install Admin SDK dependencies
+        working-directory: admin-scripts
+        run: npm install
+
+      - name: Create super_owner user and set custom claims
+        working-directory: admin-scripts
+        run: node set-claims-ci.js
+
+      - name: Cleanup credentials
+        if: always()
+        run: rm -f "${{ steps.auth.outputs.credentials_file_path }}"
