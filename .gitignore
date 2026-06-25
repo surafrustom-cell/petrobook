@@ -1,0 +1,55 @@
+# ── Firebase credentials — NEVER commit real credentials ──────────────────────
+# After you fill in FIREBASE_CONFIG in index_standalone.html, do NOT commit it
+# to a public repository. Use environment variables or a private repo only.
+.env
+.env.local
+.env.production
+firebase-credentials.json
+service-account*.json
+*-service-account.json
+
+# ── Firebase local files ───────────────────────────────────────────────────────
+.firebase/
+.firebaserc.local
+
+# ── GitHub Actions secrets (NEVER commit service account key files) ────────────
+# The CI/CD workflow reads these from GitHub repository secrets, not files.
+# Do NOT add serviceAccount.json or any key file to this repo.
+*serviceAccount*.json
+*service-account-key*.json
+
+# ── PetroBook backup files (development artifacts) ────────────────────────────
+index_standalone.PRE_*.html
+*.html.bak
+*.bak
+
+# ── Node / npm ────────────────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-error.log
+
+# ── macOS system files ────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V7
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ── Development artifacts ──────────────────────────────────────────────────────
+*.log
+journal.txt
+PHASE_*.md
+BUG_*.md
+BATCH_*.md
+MASTER_STATUS*.md
+
+# ── Audit / report files ──────────────────────────────────────────────────────
+*_ANALYSIS.md
+*_REPORT.md
+*_AUDIT.md
+*_ROADMAP.md
+*_PLAN.md
+*_ARCHITECTURE.md
+*_VERIFICATION.md

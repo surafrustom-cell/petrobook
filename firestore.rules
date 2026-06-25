@@ -1,0 +1,96 @@
+rules_version = '2';
+
+// PetroBook Firestore Security Rules
+// v1.1 — Fixed: /pumps/{pid}/data/* path mismatch (BUG-003)
+//        Code writes to /pumps/{pid}/data/config|snapshot|fuelHistory
+//        Rules now match the actual paths used by PB_FIRESTORE_PATHS.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helpers ─────────────────────────────────────────────────────────────
+
+    function isAuth()          { return request.auth != null; }
+    function accountId()       { return request.auth.token.accountId; }
+    function userRole()        { return request.auth.token.role; }
+    function isSuperOwner()    { return isAuth() && userRole() == 'super_owner'; }
+    function isOwner()         { return isAuth() && (userRole() == 'owner' || userRole() == 'super_owner'); }
+    function isManager()       { return isAuth() && (userRole() == 'manager' || isOwner()); }
+    function ownsAccount(aid)  { return isAuth() && accountId() == aid; }
+    function pumpClaim(pid)    { return request.auth.token.pumpId == pid; }
+    function canAccessPump(aid, pid) {
+      return ownsAccount(aid) && (isOwner() || pumpClaim(pid));
+    }
+    // passHash must NEVER reach Firestore
+    function noPassHash() { return !('passHash' in request.resource.data); }
+
+    // ── Users ────────────────────────────────────────────────────────────────
+    match /accounts/{aid}/users/{uid} {
+      allow read:           if ownsAccount(aid);
+      allow create, update: if ownsAccount(aid) && isOwner() && noPassHash();
+      allow delete:         if ownsAccount(aid) && isSuperOwner();
+    }
+
+    // ── Global config ────────────────────────────────────────────────────────
+    match /accounts/{aid}/global/{doc} {
+      allow read:  if ownsAccount(aid);
+      allow write: if ownsAccount(aid) && isOwner();
+    }
+
+    // ── Per-pump registry document ───────────────────────────────────────────
+    match /accounts/{aid}/pumps/{pid} {
+      allow read:  if canAccessPump(aid, pid);
+      allow write: if canAccessPump(aid, pid) && isOwner();
+    }
+
+    // ── Per-pump sub-documents (config, snapshot, fuelHistory) ───────────────
+    // IMPORTANT: Code writes to /pumps/{pid}/data/{docId} — the 'data' segment
+    // is an intermediate sub-collection. Rules must match this exact path.
+    // PB_FIRESTORE_PATHS:
+    //   config()      → accounts/{aid}/pumps/{pid}/data/config
+    //   snapshot()    → accounts/{aid}/pumps/{pid}/data/snapshot
+    //   fuelHistory() → accounts/{aid}/pumps/{pid}/data/fuelHistory
+
+    match /accounts/{aid}/pumps/{pid}/data/config {
+      allow read:  if canAccessPump(aid, pid);
+      allow write: if canAccessPump(aid, pid) && isOwner();
+    }
+
+    match /accounts/{aid}/pumps/{pid}/data/snapshot {
+      // Snapshot is the live dashboard cache — managers can update it
+      allow read, write: if canAccessPump(aid, pid);
+    }
+
+    match /accounts/{aid}/pumps/{pid}/data/fuelHistory {
+      allow read:  if canAccessPump(aid, pid);
+      allow write: if canAccessPump(aid, pid) && isOwner();
+    }
+
+    // ── History — permanent; locked records cannot be updated ────────────────
+    match /accounts/{aid}/pumps/{pid}/history/{date} {
+      allow read:   if canAccessPump(aid, pid);
+      allow create: if canAccessPump(aid, pid);
+      allow update: if canAccessPump(aid, pid)
+                       && !(resource.data.get('locked', false) == true);
+      allow delete: if false;
+    }
+
+    // ── Ledger — append-only audit trail ─────────────────────────────────────
+    match /accounts/{aid}/pumps/{pid}/ledger/{date} {
+      allow read:           if canAccessPump(aid, pid);
+      allow create, update: if canAccessPump(aid, pid);
+      allow delete:         if false;
+    }
+
+    // ── Daily records (in-progress session) ───────────────────────────────────
+    match /accounts/{aid}/pumps/{pid}/records/{date} {
+      allow read, write: if canAccessPump(aid, pid);
+      allow delete:      if canAccessPump(aid, pid) && isOwner();
+    }
+
+    // ── Deny everything else ──────────────────────────────────────────────────
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

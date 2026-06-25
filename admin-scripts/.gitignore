@@ -1,0 +1,9 @@
+# CRITICAL: Never commit your service account key
+serviceAccount.json
+*-serviceAccount.json
+*serviceAccount*.json
+service-account*.json
+
+# Node deps
+node_modules/
+npm-debug.log*
