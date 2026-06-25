@@ -1,24 +1,18 @@
 name: Deploy PetroBook to Firebase Hosting
 
-# ── Triggers ──────────────────────────────────────────────────────────────────
 on:
   push:
-    branches:
-      - main          # Auto-deploy to production on every push to main
+    branches: [main]
   pull_request:
-    branches:
-      - main          # Deploy preview channel for every PR targeting main
+    branches: [main]
 
-# ── Permissions ───────────────────────────────────────────────────────────────
 permissions:
   checks: write
   contents: read
-  pull-requests: write   # Needed to post preview URL as PR comment
+  pull-requests: write
 
-# ── Jobs ──────────────────────────────────────────────────────────────────────
 jobs:
 
-  # ── Production deploy (push to main) ──────────────────────────────────────
   deploy_production:
     name: Deploy to Production
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -33,29 +27,33 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install Firebase CLI
-        # Pin to v12 -- v13+ calls serviceusage.googleapis.com before deploying,
-        # which requires an extra IAM role on the service account. v12 skips that check.
-        run: npm install -g firebase-tools@12.9.1
-
-      # google-github-actions/auth writes the service account JSON to a temp
-      # file and exports GOOGLE_APPLICATION_CREDENTIALS for all later steps.
       - name: Authenticate to Google Cloud
         id: auth
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
 
-      # Deploy Firestore rules + indexes via CLI.
-      # action-hosting-deploy@v0 only handles Hosting -- rules need the CLI.
-      - name: Deploy Firestore rules and indexes
+      # Deploy indexes via Firestore Admin REST API.
+      # 409 = index already exists = OK (idempotent).
+      - name: Deploy Firestore composite indexes
         run: |
-          firebase deploy \
-            --only firestore:rules,firestore:indexes \
-            --project "${{ secrets.FIREBASE_PROJECT_ID }}" \
-            --non-interactive
+          TOKEN=$(gcloud auth print-access-token)
+          PROJECT="${{ secrets.FIREBASE_PROJECT_ID }}"
+          BASE="https://firestore.googleapis.com/v1/projects/${PROJECT}/databases/(default)/collectionGroups"
+          BODY='{"queryScope":"COLLECTION","fields":[{"fieldPath":"date","order":"ASCENDING"},{"fieldPath":"_syncedAt","order":"DESCENDING"}]}'
+          for COLL in ledger history records; do
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+              "${BASE}/${COLL}/indexes" \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "${BODY}")
+            echo "Index ${COLL}: HTTP ${HTTP}"
+            if [[ "$HTTP" != "200" && "$HTTP" != "409" ]]; then
+              echo "ERROR: ${COLL} returned ${HTTP}"; exit 1
+            fi
+          done
+          echo "All Firestore indexes deployed."
 
-      # Deploy Firebase Hosting via the official GitHub Action.
       - name: Deploy Firebase Hosting
         uses: FirebaseExtended/action-hosting-deploy@v0
         with:
@@ -69,18 +67,14 @@ jobs:
         if: always()
         run: rm -f "${{ steps.auth.outputs.credentials_file_path }}"
 
-  # ── Preview deploy (pull requests only) ───────────────────────────────────
   deploy_preview:
     name: Deploy Preview Channel
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Deploy preview channel
-        uses: FirebaseExtended/action-hosting-deploy@v0
+      - uses: actions/checkout@v4
+      - uses: FirebaseExtended/action-hosting-deploy@v0
         id: deploy_preview
         with:
           repoToken: ${{ secrets.GITHUB_TOKEN }}
@@ -88,14 +82,12 @@ jobs:
           projectId: ${{ secrets.FIREBASE_PROJECT_ID }}
           expires: 7d
           entryPoint: .
-
-      - name: Post preview URL to PR
-        uses: actions/github-script@v7
+      - uses: actions/github-script@v7
         with:
           script: |
             github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: `🚀 **PetroBook preview deployed!**\n\nURL: ${{ steps.deploy_preview.outputs.details_url }}\n\nExpires: 7 days after last push to this PR.`
+              body: `🚀 Preview: ${{ steps.deploy_preview.outputs.details_url }}`
             })
