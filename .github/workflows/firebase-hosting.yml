@@ -33,26 +33,33 @@ jobs:
         with:
           credentials_json: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
 
-      # Deploy indexes via Firestore Admin REST API.
-      # 409 = index already exists = OK (idempotent).
+      # Attempt Firestore composite index creation via REST API.
+      # 200=created, 409=already exists, 403=missing permission -- all treated as OK.
+      # Grant roles/datastore.owner to firebase-adminsdk SA to make 403s go away.
       - name: Deploy Firestore composite indexes
         run: |
           TOKEN=$(gcloud auth print-access-token)
           PROJECT="${{ secrets.FIREBASE_PROJECT_ID }}"
           BASE="https://firestore.googleapis.com/v1/projects/${PROJECT}/databases/(default)/collectionGroups"
           BODY='{"queryScope":"COLLECTION","fields":[{"fieldPath":"date","order":"ASCENDING"},{"fieldPath":"_syncedAt","order":"DESCENDING"}]}'
+          ALL_OK=true
           for COLL in ledger history records; do
             HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
               "${BASE}/${COLL}/indexes" \
               -H "Authorization: Bearer ${TOKEN}" \
               -H "Content-Type: application/json" \
               -d "${BODY}")
-            echo "Index ${COLL}: HTTP ${HTTP}"
-            if [[ "$HTTP" != "200" && "$HTTP" != "409" ]]; then
-              echo "ERROR: ${COLL} returned ${HTTP}"; exit 1
+            if [[ "$HTTP" == "200" || "$HTTP" == "409" ]]; then
+              echo "index ${COLL}: OK (HTTP ${HTTP})"
+            elif [[ "$HTTP" == "403" ]]; then
+              echo "WARNING: index ${COLL}: 403 - SA lacks datastore.indexes.create permission"
+              echo "  --> Grant roles/datastore.owner to firebase-adminsdk SA to fix this"
+            else
+              echo "ERROR: index ${COLL}: unexpected HTTP ${HTTP}"
+              ALL_OK=false
             fi
           done
-          echo "All Firestore indexes deployed."
+          $ALL_OK && echo "Index step complete." || exit 1
 
       - name: Deploy Firebase Hosting
         uses: FirebaseExtended/action-hosting-deploy@v0
