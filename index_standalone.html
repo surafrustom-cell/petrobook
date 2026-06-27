@@ -37659,6 +37659,20 @@ function showOwnerPage(){
   _currentPage='owner';
   renderOwnerDashboard();
   try{ lIcons({nodes:[o]}); }catch(e){}
+  // Clip page to exact content height — CSS height:auto is unreliable on mobile Safari/Chrome
+  // for position:fixed flex containers. Measure after paint and set explicit px height.
+  requestAnimationFrame(function(){
+    var pg=document.getElementById('pg-owner');
+    var sc=document.getElementById('ow-scroll');
+    if(!pg||!sc) return;
+    var ptop=parseFloat(getComputedStyle(pg).paddingTop)||0;
+    var need=ptop+sc.scrollHeight;
+    var vh=window.innerHeight;
+    var h=Math.min(need,vh);
+    pg.style.setProperty('height',h+'px','important');
+    pg.style.setProperty('bottom','auto','important');
+    pg.style.setProperty('overflow-y',(need>vh)?'auto':'hidden','important');
+  });
 }
 function enterOwnerMode(){ _ownerViewing=false; document.body.classList.remove('owner-viewing'); showOwnerPage(); }
 function enterManagerMode(id){
