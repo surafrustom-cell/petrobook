@@ -5212,12 +5212,21 @@ body.owner-viewing #pg-history{padding-top:calc(46px + var(--safe-top));}
 .ow-pump-total.no-sales  { color: var(--muted); }
 .ow-chev { width: 14px; height: 14px; color: var(--border2); flex-shrink: 0; }
 
-/* ── Owner overview: page itself is the scroll root ──────────────────────────
-   showOwnerPage() hides the bottom nav bar (bar.style.display='none'), so
-   the 72 px nav-clearance that .pg-scroll applies is pure wasted blank space.
-   Fix: #pg-owner scrolls (overflow-y:auto); #ow-scroll is content-sized only.
+/* ── Owner overview: page shrinks to content, scrolls when tall ───────────────
+   showOwnerPage() hides the bottom nav bar. Two bugs existed:
+   1. .pg-scroll had flex:1 → stretched to fill full viewport even on short lists.
+   2. padding-bottom had 72px nav-clearance for a hidden bar → wasted blank.
+   Fix strategy:
+   • #pg-owner gets bottom:auto + height:auto so it shrinks to content height.
+     max-height:100% (= viewport height for position:fixed) caps it; overflow-y:auto
+     then scrolls long lists. Short lists → page ends right after last card.
+   • #ow-scroll is content-sized (flex:none, overflow:visible) — page scrolls, not the inner div.
+   • padding-bottom drops the 72px nav clearance; only safe-area + 20px breathing room remain.
    ──────────────────────────────────────────────────────────────────────────── */
 #pg-owner {
+  bottom: auto !important;           /* Don't pin to viewport bottom */
+  height: auto !important;           /* Shrink to content height     */
+  max-height: 100% !important;       /* Cap at viewport (100% = viewport for fixed elements) */
   overflow-y: auto !important;
   overflow-x: hidden !important;
   -webkit-overflow-scrolling: touch !important;
@@ -5230,7 +5239,7 @@ body.owner-viewing #pg-history{padding-top:calc(46px + var(--safe-top));}
   overflow: visible !important;
   gap: 10px !important;
   padding-top: 12px !important;
-  /* No 72 px nav clearance — bottom bar is hidden on the owner overview page.
+  /* No 72 px nav clearance — bottom bar is hidden on owner overview page.
      Only safe-area-inset-bottom + small breathing room. */
   padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 20px) !important;
 }
