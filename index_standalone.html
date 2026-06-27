@@ -32,6 +32,11 @@
   --c91:#059669;--c91-dim:rgba(5,150,105,.10);--c91-bd:rgba(5,150,105,.22);
   --c95:#1d4ed8;--c95-dim:rgba(29,78,216,.09);--c95-bd:rgba(29,78,216,.20);
   --cds:#b45309;--cds-dim:rgba(180,83,9,.10);--cds-bd:rgba(180,83,9,.22);
+  /* ── Safe-area insets (PWA / notch / Dynamic Island / status bar) ── */
+  --safe-top:    env(safe-area-inset-top,    0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left:   env(safe-area-inset-left,   0px);
+  --safe-right:  env(safe-area-inset-right,  0px);
 }
 /* ── THEME VARIABLES ── */
 :root {
@@ -147,7 +152,8 @@ header.hdr{position:relative;z-index:10;flex-shrink:0;}
   background:var(--bg);
   z-index:1;
   overflow:hidden;
-  padding-top:88px;
+  /* 88px = header height; var(--safe-top) pushes below notch/status bar in standalone PWA */
+  padding-top:calc(88px + var(--safe-top));
   box-sizing:border-box;
 }
 .pg.pg-active{display:flex;}
@@ -226,6 +232,8 @@ header.hdr{
   flex-shrink:0;
   position:relative;z-index:10;
   padding:0 16px;
+  /* Push content below status bar / notch / Dynamic Island in standalone PWA */
+  padding-top: var(--safe-top);
   /* Liquid glass */
   background:rgba(255,255,255,.80);
   backdrop-filter:blur(24px) saturate(180%);
@@ -255,7 +263,8 @@ header.hdr{
 /* Action buttons */
 .hdr-actions{display:flex;align-items:center;gap:6px;}
 .hdr-icon-btn{
-  width:34px;height:34px;
+  /* Minimum 44×44px touch target (iOS/Android PWA requirement) */
+  width:44px;height:44px;
   border-radius:10px;
   background:transparent;
   border:1px solid rgba(0,0,0,.08);
@@ -733,7 +742,7 @@ header.hdr{
 }
 .ovl.open .sheet{transform:translateY(0);}
 .fullsheet{max-height:94vh;}
-#ov-pnl .sheet{max-height:100dvh;max-height:100vh;border-radius:0;}
+#ov-pnl .sheet{max-height:100vh;max-height:100dvh;border-radius:0;}
 .sh-handle{width:36px;height:4px;background:var(--border2);border-radius:2px;margin:12px auto 0;}
 .sh-hdr{
   background:#ffffff;display:flex;align-items:center;padding:14px 16px 10px;gap:12px;}
@@ -1432,7 +1441,8 @@ header.hdr{
 /* Back button — left side */
 .st-back-btn{
   display:flex;align-items:center;gap:5px;
-  padding:8px 4px 8px 0;
+  /* min-height ensures 44px touch target without changing visual layout */
+  padding:8px 4px 8px 0;min-height:44px;
   border:none;background:transparent;
   color:#111827;cursor:pointer;
   font-size:15px;font-weight:600;
@@ -1777,6 +1787,49 @@ html[lang="bn"] .i18n-pill .i18n-label{font-size:12px;}
 @supports(padding:max(0px)){
   .st-hdr{padding-top:max(0px,env(safe-area-inset-top));}
   .cfg-save-wrap{padding-bottom:max(14px,env(safe-area-inset-bottom));}
+}
+
+/* ══ STANDALONE PWA — installed via Add to Home Screen ══
+   Reinforces safe-area spacing for all device classes:
+   iPhone notch / Dynamic Island / Android status bar /
+   Samsung hole-punch / Xiaomi / Pixel cutout
+   ════════════════════════════════════════════════════════ */
+@media (display-mode: standalone) {
+  /* Extra breathing room below Dynamic Island / notch */
+  header.hdr {
+    padding-top: max(var(--safe-top), 12px);
+  }
+  /* Page containers: use max() so we never get less than the base padding */
+  .pg {
+    padding-top: calc(88px + max(var(--safe-top), 0px));
+  }
+  /* Owner-viewing pages (no main header shown) */
+  body.owner-viewing .pg {
+    padding-top: calc(54px + max(var(--safe-top), 0px));
+  }
+  body.owner-viewing #pg-history {
+    padding-top: calc(46px + max(var(--safe-top), 0px));
+  }
+  /* Owner sub-page header already uses env() — add standalone boost */
+  .ow2-page-hdr {
+    padding-top: calc(max(var(--safe-top), 0px) + 10px);
+  }
+  /* Settings overlay header */
+  .st-hdr {
+    padding-top: max(var(--safe-top), 0px);
+  }
+  .st-hdr-row {
+    padding-top: 4px;
+  }
+  /* Safe right/left for landscape orientation (Samsung S series, iPad) */
+  .pg, .pg-scroll, header.hdr {
+    padding-left: max(14px, var(--safe-left));
+    padding-right: max(14px, var(--safe-right));
+  }
+  header.hdr {
+    padding-left: max(16px, var(--safe-left));
+    padding-right: max(16px, var(--safe-right));
+  }
 }
 
 
@@ -4293,8 +4346,8 @@ html[lang="bn"] .sl-day-date{
 .pb-ownerbar-tag{font-size:9px;font-weight:800;letter-spacing:.6px;text-transform:uppercase;color:#7c3aed;background:rgba(124,58,237,.12);padding:3px 8px;border-radius:var(--r99);}
 /* While owner is viewing a pump: hide the app header, slim the page top */
 body.owner-viewing #app-hdr{display:none !important;}
-body.owner-viewing .pg{padding-top:54px;}
-body.owner-viewing #pg-history{padding-top:46px;}
+body.owner-viewing .pg{padding-top:calc(54px + var(--safe-top));}
+body.owner-viewing #pg-history{padding-top:calc(46px + var(--safe-top));}
 
 /* ══════════════════════════════════════════════════════════
    AUTH SYSTEM v3 — Multi-Owner · Super Owner · Role Hierarchy
@@ -5173,7 +5226,8 @@ body.owner-viewing #pg-history{padding-top:46px;}
   flex-shrink:0;
 }
 .ow2-page-back{
-  width:36px;height:36px;border-radius:10px;
+  /* Minimum 44×44px touch target */
+  width:44px;height:44px;border-radius:10px;
   background:var(--sf2);border:1px solid var(--border);
   display:flex;align-items:center;justify-content:center;
   flex-shrink:0;-webkit-tap-highlight-color:transparent;
