@@ -105,6 +105,7 @@ input, textarea { transition: border-color .12s ease, box-shadow .12s ease; }
 *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
 html{
   height:100%;
+  min-height:-webkit-fill-available; /* iOS Safari: fill actual painted canvas, not just layout viewport */
   /* Must match --bg exactly for both themes so the gap under the floating bar
      shows the same colour as the page, not a different shade */
   background:#f8fafc;
@@ -115,6 +116,7 @@ body{
   background:var(--bg);
   color:var(--text);
   min-height:100%;
+  min-height:-webkit-fill-available; /* iOS Safari: propagate fill-available down the chain */
   overscroll-behavior:none;
   -webkit-font-smoothing:antialiased;
   padding:0;margin:0;
@@ -139,7 +141,7 @@ html,body{height:100%;margin:0;padding:0;overflow:hidden;}
 .st-body,.hist-body,.report-body,.ow2-page-body,.content,
 .pb-mgr-body,.pb-um-panel,.stmt-body,.qv-body,
 #tc-history,#tb-history,.pnl-scroll{touch-action:pan-y;}
-.app{max-width:460px;margin:0 auto;height:100%;background:var(--bg);display:flex;flex-direction:column;position:relative;}
+.app{max-width:460px;margin:0 auto;height:100%;min-height:-webkit-fill-available;background:var(--bg);display:flex;flex-direction:column;position:relative;}
 .app-pages{flex:1;min-height:0;position:relative;overflow:hidden;}
 header.hdr{position:relative;z-index:10;flex-shrink:0;}
 
@@ -8404,57 +8406,8 @@ tr:last-child td{border-bottom:none}
 
 
 
-/* ██ DIAGNOSTIC — REMOVE AFTER ROOT CAUSE IDENTIFIED ██
-   html=RED  body=GREEN  .app=BLUE
-   Whichever color shows in the white strip = that layer is exposed */
-html   { background: red   !important; }
-body   { background: green !important; }
-.app   { background: blue  !important; }
-/* ██ END DIAGNOSTIC ██ */
-
 </style>
 <script>
-/* ██ DIAGNOSTIC MEASUREMENTS — auto-logs on load ██ */
-window.addEventListener('load', function() {
-  setTimeout(function() {
-    function m(el, label) {
-      if (!el) return { label: label, ERR: 'NOT FOUND' };
-      var r = el.getBoundingClientRect();
-      var s = getComputedStyle(el);
-      return {
-        label: label,
-        wh: Math.round(r.width) + 'x' + Math.round(r.height),
-        top: Math.round(r.top), bot: Math.round(r.bottom),
-        h: s.height, minH: s.minHeight,
-        pt: s.paddingTop, pb: s.paddingBottom,
-        pos: s.position, ovY: s.overflowY,
-        bg: s.backgroundColor
-      };
-    }
-    var pg = document.querySelector('.pg.pg-active');
-    var data = {
-      'window.innerHeight': window.innerHeight,
-      'window.innerWidth': window.innerWidth,
-      'documentElement.clientHeight': document.documentElement.clientHeight,
-      'visualViewport.height': window.visualViewport ? window.visualViewport.height : 'n/a',
-      'visualViewport.offsetTop': window.visualViewport ? window.visualViewport.offsetTop : 'n/a',
-      '--safe-top': getComputedStyle(document.documentElement).getPropertyValue('--safe-top').trim(),
-      '--safe-bottom': getComputedStyle(document.documentElement).getPropertyValue('--safe-bottom').trim(),
-      'standalone': window.matchMedia('(display-mode: standalone)').matches,
-      html: m(document.documentElement, 'html'),
-      body: m(document.body, 'body'),
-      app: m(document.getElementById('app'), '.app'),
-      hdr: m(document.getElementById('app-hdr'), 'header.hdr'),
-      appPages: m(document.getElementById('app-pages'), '.app-pages'),
-      activePg: pg ? m(pg, '.pg#' + pg.id) : 'none',
-      pgScroll: pg ? m(pg.querySelector('.pg-scroll'), '.pg-scroll') : 'none',
-      bottomBar: m(document.getElementById('bottom-bar'), '.bottom-bar')
-    };
-    console.log('=== PETROBOOK LAYOUT DIAGNOSTIC ===');
-    console.log(JSON.stringify(data, null, 2));
-  }, 500);
-});
-/* ██ END DIAGNOSTIC ██ */
 (function(){
   var lastTap=0;
   document.addEventListener('touchend',function(e){
