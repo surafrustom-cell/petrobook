@@ -1832,7 +1832,9 @@ html[lang="bn"] .i18n-pill .i18n-label{font-size:12px;}
   .mr-fixed-hdr {
     padding-top: max(var(--safe-top), 12px);
   }
-  /* Safe right/left for landscape orientation (Samsung S series, iPad) */
+}
+/* Safe right/left for landscape orientation ONLY (Samsung S series, iPad, landscape notch) */
+@media (display-mode: standalone) and (orientation: landscape) {
   .pg, .pg-scroll, header.hdr {
     padding-left: max(14px, var(--safe-left));
     padding-right: max(14px, var(--safe-right));
