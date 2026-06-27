@@ -5212,11 +5212,27 @@ body.owner-viewing #pg-history{padding-top:calc(46px + var(--safe-top));}
 .ow-pump-total.no-sales  { color: var(--muted); }
 .ow-chev { width: 14px; height: 14px; color: var(--border2); flex-shrink: 0; }
 
-/* ── Scroll container ── */
+/* ── Owner overview: page itself is the scroll root ──────────────────────────
+   showOwnerPage() hides the bottom nav bar (bar.style.display='none'), so
+   the 72 px nav-clearance that .pg-scroll applies is pure wasted blank space.
+   Fix: #pg-owner scrolls (overflow-y:auto); #ow-scroll is content-sized only.
+   ──────────────────────────────────────────────────────────────────────────── */
+#pg-owner {
+  overflow-y: auto !important;
+  overflow-x: hidden !important;
+  -webkit-overflow-scrolling: touch !important;
+  overscroll-behavior-y: contain !important;
+}
 #ow-scroll {
+  /* Content-sized — NOT flex:1. The page (#pg-owner) handles scrolling. */
+  flex: none !important;
+  min-height: 0 !important;
+  overflow: visible !important;
   gap: 10px !important;
   padding-top: 12px !important;
-  padding-bottom: calc(72px + env(safe-area-inset-bottom,0px)) !important;
+  /* No 72 px nav clearance — bottom bar is hidden on the owner overview page.
+     Only safe-area-inset-bottom + small breathing room. */
+  padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 20px) !important;
 }
 
 /* ── Section header (Analysis/Stock/History sub-pages only) ── */
