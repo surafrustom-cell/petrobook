@@ -165,7 +165,7 @@ header.hdr{position:relative;z-index:10;flex-shrink:0;}
   overflow-y:auto;
   -webkit-overflow-scrolling:touch;
   overscroll-behavior-y:contain;
-  padding:14px 12px calc(72px + env(safe-area-inset-bottom,0px));
+  padding:14px 10px calc(72px + env(safe-area-inset-bottom,0px));
   display:flex;flex-direction:column;gap:14px;
 }
 #pg-home .pg-scroll{perspective:1400px;perspective-origin:50% 50%;}
@@ -181,7 +181,7 @@ header.hdr{position:relative;z-index:10;flex-shrink:0;}
   overflow-y:auto;
   -webkit-overflow-scrolling:touch;
   overscroll-behavior-y:contain;
-  padding:8px 12px calc(72px + env(safe-area-inset-bottom,0px));
+  padding:8px 10px calc(72px + env(safe-area-inset-bottom,0px));
   display:flex;flex-direction:column;gap:6px;
 }
 /* hc-detail defined in history card CSS block */
@@ -2140,7 +2140,7 @@ html[lang="bn"] .i18n-pill .i18n-label{font-size:12px;}
 .hpb-stat-val{font-size:11px;font-weight:800;font-family:var(--font-mono);color:var(--text);}
 
 .hist-empty{
-  text-align:center;padding:56px 24px;
+  text-align:center;padding:20px 24px;
   display:flex;flex-direction:column;align-items:center;gap:12px;
 }
 .hist-empty-ico{width:56px;height:56px;border-radius:16px;background:var(--sf2);display:flex;align-items:center;justify-content:center;color:var(--muted);}
@@ -3985,8 +3985,8 @@ html[lang="bn"] .i18n-pill .i18n-label{font-size:12px;}
 /* ── Empty state ──────────────────────────────────────────────────── */
 .stmt-empty{
   display:flex;flex-direction:column;
-  align-items:center;justify-content:center;
-  gap:10px;padding:72px 32px;text-align:center;
+  align-items:center;justify-content:flex-start;
+  gap:10px;padding:24px 32px;text-align:center;
 }
 .stmt-empty-ico{
   width:64px;height:64px;border-radius:20px;
@@ -5257,7 +5257,7 @@ body.owner-viewing #pg-history{padding-top:calc(46px + var(--safe-top));}
 .ow2-page-back svg{width:18px;height:18px;color:var(--text);}
 .ow2-page-title{font-size:17px;font-weight:800;color:var(--text);letter-spacing:-.3px;}
 .ow2-page-sub{font-size:11px;font-weight:600;color:var(--muted);margin-top:1px;}
-.ow2-page-body{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:10px 12px calc(env(safe-area-inset-bottom,0px) + 16px);}
+.ow2-page-body{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:10px 10px calc(env(safe-area-inset-bottom,0px) + 16px);}
 
 /* ══════════════════════════════════════════════════════════
    OWNER ANALYSIS — v85 Premium Executive Dashboard
@@ -6297,7 +6297,7 @@ body.theme-dark .sk-rank-bar{background:#2a2d3e;}
 .ohc-dot.pc-4{background:#be185d;}.ohc-dot.pc-5{background:#0d9488;}
 
 /* ── Empty state ─────────────────────────────────────────── */
-.ow2-hist-empty{text-align:center;padding:56px 20px;}
+.ow2-hist-empty{text-align:center;padding:20px 20px;}
 .ow2-hist-empty svg{width:44px;height:44px;opacity:.22;margin-bottom:14px;display:block;margin-left:auto;margin-right:auto;color:var(--dim);}
 .ow2-hist-empty-txt{font-size:13px;font-weight:700;color:var(--dim);}
 .ow2-hist-empty-sub{font-size:11px;font-weight:600;color:var(--dim);margin-top:5px;opacity:.7;}
@@ -6644,7 +6644,7 @@ body.theme-dark .sk-rank-bar{background:#2a2d3e;}
 #pg-record { background:#f0f2f5 !important; }
 #pg-record .pg-scroll {
   gap:0 !important;
-  padding:0 0 calc(90px + env(safe-area-inset-bottom,0px)) !important;
+  padding:0 0 calc(72px + env(safe-area-inset-bottom,0px)) !important;
   display:flex; flex-direction:column;
 }
 
