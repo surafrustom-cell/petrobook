@@ -89,7 +89,10 @@ service cloud.firestore {
 
     // ── Company metadata document ────────────────────────────────────────────
     match /companies/{cid} {
-      allow read:   if isMemberOf(cid);
+      // isMemberOf() handles members; the ownerUid field check allows
+      // collection queries (e.g. .where('ownerUid','==',uid)) to work
+      // without hitting the exists() evaluation limit on queries.
+      allow read:   if isMemberOf(cid) || (isAuth() && resource.data.ownerUid == uid());
       allow create: if isAuth() && noPassHash()
                        && request.resource.data.ownerUid == uid();
       allow update: if isOwnerOf(cid) && noPassHash();
