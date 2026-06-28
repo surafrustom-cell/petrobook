@@ -12858,50 +12858,71 @@ var SyncEngine = (function () {
 
 var PB_FIRESTORE_PATHS = (function () {
 
-  // accountId: derived from Firebase Auth UID of the super_owner on first setup.
-  // All data for a PetroBook account is scoped under this single document.
-  // This enforces strict data isolation between different petrol stations.
+  // SaaS Phase 1: dual-prefix support.
+  //
+  // LEGACY mode  (default): all data under 'accounts/{accountId}/...'
+  //   accountId = Firebase Auth UID of the super_owner (existing accounts)
+  //
+  // SAAS mode: all data under 'companies/{companyId}/...'
+  //   companyId = Firestore auto-ID created at company setup (new accounts + migrated)
+  //
+  // Switch mode by calling PB_FIRESTORE_PATHS.useCompanies() after resolving companyId.
+  // All existing call-sites (aid, pid, date) continue unchanged — only the prefix differs.
 
-  function _acct(accountId) {
-    return 'accounts/' + accountId;
-  }
+  var _prefix = 'accounts'; // 'accounts' | 'companies'
+
+  function _root(id) { return _prefix + '/' + id; }
 
   return {
+    // ── Mode control (SaaS Phase 1) ──────────────────────────────────────────
+    useAccounts:  function() { _prefix = 'accounts';  },
+    useCompanies: function() { _prefix = 'companies'; },
+    getPrefix:    function() { return _prefix; },
+
     // ── User documents ──────────────────────────────────────────────────────
-    // Collection: accounts/{accountId}/users
+    // Collection: {prefix}/{id}/users
     // One document per user. userId = pb-users-v3 id field.
-    users:        function(aid)        { return _acct(aid) + '/users'; },
-    user:         function(aid, uid)   { return _acct(aid) + '/users/' + uid; },
+    users:        function(aid)        { return _root(aid) + '/users'; },
+    user:         function(aid, uid)   { return _root(aid) + '/users/' + uid; },
 
     // ── Pump documents ──────────────────────────────────────────────────────
-    // Collection: accounts/{accountId}/pumps
+    // Collection: {prefix}/{id}/pumps
     // One document per pump. pumpId = 'p1', 'p2' … 'p5'
-    pumps:        function(aid)        { return _acct(aid) + '/pumps'; },
-    pump:         function(aid, pid)   { return _acct(aid) + '/pumps/' + pid; },
+    pumps:        function(aid)        { return _root(aid) + '/pumps'; },
+    pump:         function(aid, pid)   { return _root(aid) + '/pumps/' + pid; },
 
     // ── Per-pump sub-documents ─────────────────────────────────────────────
-    config:       function(aid, pid)   { return _acct(aid) + '/pumps/' + pid + '/data/config'; },
-    snapshot:     function(aid, pid)   { return _acct(aid) + '/pumps/' + pid + '/data/snapshot'; },
-    fuelHistory:  function(aid, pid)   { return _acct(aid) + '/pumps/' + pid + '/data/fuelHistory'; },
+    config:       function(aid, pid)   { return _root(aid) + '/pumps/' + pid + '/data/config'; },
+    snapshot:     function(aid, pid)   { return _root(aid) + '/pumps/' + pid + '/data/snapshot'; },
+    fuelHistory:  function(aid, pid)   { return _root(aid) + '/pumps/' + pid + '/data/fuelHistory'; },
 
     // ── Daily records (in-progress session state) ──────────────────────────
     // Document id = YYYY-MM-DD. Only today's date is ever written here.
-    record:       function(aid, pid, date) { return _acct(aid) + '/pumps/' + pid + '/records/' + date; },
+    record:       function(aid, pid, date) { return _root(aid) + '/pumps/' + pid + '/records/' + date; },
 
     // ── Saved daily reports (history) ──────────────────────────────────────
     // Document id = YYYY-MM-DD. Immutable after save (editTrail tracks edits).
-    history:      function(aid, pid, date) { return _acct(aid) + '/pumps/' + pid + '/history/' + date; },
+    history:      function(aid, pid, date) { return _root(aid) + '/pumps/' + pid + '/history/' + date; },
 
     // ── Ledger transactions ────────────────────────────────────────────────
     // Sub-collection: .../ledger/{date}/txns
     // Each day is a document; txns is an array field (not a sub-collection)
     // to allow atomic batch writes per day.
-    ledger:       function(aid, pid, date) { return _acct(aid) + '/pumps/' + pid + '/ledger/' + date; },
+    ledger:       function(aid, pid, date) { return _root(aid) + '/pumps/' + pid + '/ledger/' + date; },
 
     // ── Global account-level documents ────────────────────────────────────
-    globalConfig: function(aid)        { return _acct(aid) + '/global/config'; },
-    globalLang:   function(aid)        { return _acct(aid) + '/global/lang'; },
-    activePump:   function(aid)        { return _acct(aid) + '/global/activePump'; },
+    globalConfig: function(aid)        { return _root(aid) + '/global/config'; },
+    globalLang:   function(aid)        { return _root(aid) + '/global/lang'; },
+    activePump:   function(aid)        { return _root(aid) + '/global/activePump'; },
+
+    // ── SaaS Phase 1: top-level paths (always absolute, never use _root) ──
+    // companies/{companyId}          — company metadata document
+    // userProfiles/{uid}             — maps Firebase Auth UID → companyId + role
+    // companies/{companyId}/members  — company member list (for future invitation system)
+    company:       function(cid)        { return 'companies/' + cid; },
+    userProfile:   function(uid)        { return 'userProfiles/' + uid; },
+    members:       function(cid)        { return 'companies/' + cid + '/members'; },
+    member:        function(cid, uid)   { return 'companies/' + cid + '/members/' + uid; },
   };
 
 })();
@@ -13073,13 +13094,17 @@ var PB_SYNC_OP_MAP = (function () {
       merge:     false,
       transform: function(args) {
         // args[0] = usersArray — each user becomes its own Firestore doc
+        // aid is resolved at transform time from PB_FirestoreWriter (already initialised by login)
+        var _aid = (typeof PB_FirestoreWriter !== 'undefined') ? PB_FirestoreWriter.getAccountId() : null;
         var users = args[0] || [];
-        return users.map(function(u) {
+        return users.filter(function(u){ return u && u.id; }).map(function(u) {
+          var doc = Object.assign({}, u, { _syncedAt: new Date().toISOString(), _v: 3 });
+          delete doc.passHash;  // SECURITY: passHash must NEVER reach Firestore
           return {
-            docPath: PB_FIRESTORE_PATHS.user(null /*aid*/, u.id),
-            data: Object.assign({}, u, { _syncedAt: new Date().toISOString(), _v: 3 }),
+            docPath: _aid ? PB_FIRESTORE_PATHS.user(_aid, u.id) : null,
+            data: doc,
           };
-        });
+        }).filter(function(item){ return item.docPath; }); // drop items with no path
       },
       deviceOnly: false,
       syncGroup: 'auth',
@@ -13093,13 +13118,15 @@ var PB_SYNC_OP_MAP = (function () {
       merge:     false,
       transform: function(args) {
         // args[0] = pumpsArray — fan-out handled by PB_QueueReplayEngine batch path
+        // aid is resolved at transform time from PB_FirestoreWriter (already initialised by login)
+        var _aid = (typeof PB_FirestoreWriter !== 'undefined') ? PB_FirestoreWriter.getAccountId() : null;
         var pumps = Array.isArray(args[0]) ? args[0] : [];
-        return pumps.map(function(p) {
+        return pumps.filter(function(p){ return p && p.id; }).map(function(p) {
           return {
-            docPath: PB_FIRESTORE_PATHS.pump(null /*aid resolved at replay*/, p.id),
+            docPath: _aid ? PB_FIRESTORE_PATHS.pump(_aid, p.id) : null,
             data: Object.assign({}, p, { _syncedAt: new Date().toISOString(), _v: 1 }),
           };
-        });
+        }).filter(function(item){ return item.docPath; }); // drop items with no path
       },
       deviceOnly: false,
       syncGroup: 'config',
@@ -13187,13 +13214,20 @@ var PB_SYNC_OP_MAP = (function () {
     // ── History (saved daily reports) ──────────────────────────────────────
     saveReport: {
       // historyObj = { 'YYYY-MM-DD': record, … } — fan out to per-date docs
+      // aid is resolved via PB_FirestoreWriter.getAccountId() at transform time.
+      // pid is NOT available in args — it is stored on op.pumpId in QueueManager
+      // and resolved by replayOne() as 'var pid = op.pumpId'. The replayOne batch
+      // handler detects the _histDate sentinel and builds the full path there.
       path:      function(aid, pid) { return PB_FIRESTORE_PATHS.history(aid, pid, '__BATCH__'); },
       merge:     false,
       transform: function(args) {
+        var _aid = (typeof PB_FirestoreWriter !== 'undefined') ? PB_FirestoreWriter.getAccountId() : null;
         var hist = args[0] || {};
         return Object.keys(hist).map(function(date) {
           return {
-            docPath: PB_FIRESTORE_PATHS.history(null, null, date), // aid/pid filled at write
+            // _histDate sentinel: replayOne builds the real path using aid + op.pumpId + date
+            _histDate: date,
+            _aid: _aid,  // carry resolved aid so replayOne can use it if needed
             data: Object.assign({}, hist[date], { _syncedAt: new Date().toISOString(), _v: 1 }),
           };
         });
@@ -13319,7 +13353,13 @@ var PB_QueueReplayEngine = (function () {
     // saveReport and saveUser return arrays (batch fan-out)
     if (Array.isArray(data)) {
       var items = data.map(function(d) {
-        return { path: d.docPath || path, data: d.data || d, options: { merge: false } };
+        // _histDate sentinel: saveReport embeds date + carries aid; pid comes from op.pumpId
+        var itemPath = d.docPath ||
+          (d._histDate
+            ? PB_FIRESTORE_PATHS.history(d._aid || aid, pid, d._histDate)
+            : null) ||
+          path;
+        return { path: itemPath, data: d.data || d, options: { merge: false } };
       }).filter(function(d) { return d.path; });
       if (!items.length) {
         QueueManager.markConfirmed(op.id);
@@ -13641,8 +13681,9 @@ var PB_FirestoreWriter = (function () {
       if (!parts[i] || !parts[i].trim())
         return { valid: false, error: 'path segment ' + i + ' is empty: ' + path };
     }
-    if (parts[0] !== 'accounts')
-      return { valid: false, error: 'paths must start with accounts/{aid}: ' + path };
+    // SaaS Phase 1: accept accounts/ (legacy), companies/ (SaaS), userProfiles/ (SaaS)
+    if (parts[0] !== 'accounts' && parts[0] !== 'companies' && parts[0] !== 'userProfiles')
+      return { valid: false, error: 'paths must start with accounts/{aid}, companies/{cid}, or userProfiles/{uid}: ' + path };
     return { valid: true, segments: parts.length };
   }
 
@@ -28735,6 +28776,315 @@ function _migrateToV3(){
   if(users.length) _saveUsers(users);
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+//  SAAS PHASE 1 — COMPANY RESOLUTION HELPERS
+//  These functions bridge the gap between Firebase Auth identity and
+//  Firestore company data without requiring Cloud Functions.
+//  Priority order for companyId resolution:
+//    1. localStorage cache ('pb-company-id')           — fastest, warm devices
+//    2. userProfiles/{uid} Firestore document          — cross-device restore
+//    3. companies query by ownerUid                    — fallback if profile missing
+//    4. Legacy accounts/{uid}/users                    — backward compat migration
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── localStorage cache for companyId ─────────────────────────────────────────
+function _pbGetCompanyId(){ return localStorage.getItem('pb-company-id')||null; }
+function _pbSetCompanyId(id){
+  if(id) localStorage.setItem('pb-company-id', id);
+  else   localStorage.removeItem('pb-company-id');
+}
+
+// ── Write (or overwrite) a userProfile document ───────────────────────────────
+// userProfiles/{uid} is the key document for multi-device restore.
+// It maps Firebase Auth UID → companyId + role + assignedPumps.
+function _pbWriteUserProfile(uid, data, fsDb){
+  if(!uid||!fsDb) return Promise.resolve();
+  return fsDb.doc('userProfiles/'+uid).set(
+    Object.assign({ uid:uid, updatedAt: firebase.firestore.FieldValue.serverTimestamp() }, data),
+    { merge: true }
+  ).catch(function(e){ console.warn('[PetroBook SaaS] userProfile write failed:', e.message||e); });
+}
+
+// ── Resolve companyId for an authenticated Firebase user ──────────────────────
+// Returns Promise<{companyId, role, assignedPumps, source}> or null if not found.
+// Does NOT write to Firestore — callers decide whether to migrate.
+function _pbResolveUserCompany(fbUser, fsDb){
+  if(!fbUser||!fsDb) return Promise.resolve(null);
+  var uid = fbUser.uid;
+
+  // Step 1: read userProfiles/{uid} (fastest cross-device path)
+  return fsDb.doc('userProfiles/'+uid).get().then(function(profDoc){
+    if(profDoc.exists){
+      var d = profDoc.data()||{};
+      if(d.companyId){
+        console.info('[PetroBook SaaS] userProfile found. companyId='+d.companyId);
+        return { companyId:d.companyId, role:d.role||'owner', assignedPumps:d.assignedPumps||[], source:'userProfile' };
+      }
+    }
+
+    // Step 2: query companies where ownerUid == uid
+    return fsDb.collection('companies').where('ownerUid','==',uid).limit(1).get()
+      .then(function(snap){
+        if(!snap.empty){
+          var cd = snap.docs[0].data()||{};
+          var cid = cd.companyId || snap.docs[0].id;
+          console.info('[PetroBook SaaS] company found by ownerUid. companyId='+cid);
+          return { companyId:cid, role:'owner', assignedPumps:[], source:'companyQuery' };
+        }
+
+        // Step 3: check legacy accounts/{uid}/users
+        return fsDb.collection('accounts/'+uid+'/users').limit(1).get()
+          .then(function(legSnap){
+            if(!legSnap.empty){
+              console.info('[PetroBook SaaS] legacy account found for uid='+uid);
+              return { companyId:null, role:'owner', assignedPumps:[], source:'legacyAccount', legacyAccountId:uid };
+            }
+            return null;
+          });
+      });
+  }).catch(function(e){
+    console.warn('[PetroBook SaaS] resolveUserCompany failed:', e.message||e);
+    return null;
+  });
+}
+
+// ── Migrate legacy accounts/{uid}/... → companies/{autoId}/... ────────────────
+// One-time migration on first login on a SaaS-aware device.
+// Creates the company doc, writes userProfile, stores companyId in localStorage.
+// The original accounts/{uid}/... data is left untouched for rollback safety.
+function _pbMigrateLegacyAccount(fbUser, fsDb, userEmail){
+  if(!fbUser||!fsDb) return Promise.resolve(null);
+  var uid = fbUser.uid;
+  console.info('[PetroBook SaaS] Starting legacy migration for uid='+uid);
+
+  // Create new company document
+  var companyRef = fsDb.collection('companies').doc();
+  var cid = companyRef.id;
+  var stationName = (function(){
+    try{
+      var users = _getUsers();
+      var su = users.find(function(u){ return u.role==='super_owner'||u.isSuperOwner; });
+      return (su&&su.stationName)||'PetroBook';
+    }catch(e){ return 'PetroBook'; }
+  })();
+
+  return companyRef.set({
+    companyId: cid,
+    name: stationName,
+    ownerUid: uid,
+    ownerEmail: userEmail||'',
+    status: 'active',
+    createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+    migratedFrom: 'accounts/'+uid,
+    migratedAt: firebase.firestore.FieldValue.serverTimestamp(),
+    settings: { currency: (typeof GCFG!=='undefined'&&GCFG.currency)||'KWD' }
+  }).then(function(){
+    // Write member document for the owner
+    return fsDb.doc('companies/'+cid+'/members/'+uid).set({
+      uid: uid, role: 'owner', status: 'active',
+      assignedPumps: [],
+      joinedAt: firebase.firestore.FieldValue.serverTimestamp()
+    });
+  }).then(function(){
+    // Write userProfile — the cross-device restore key
+    return _pbWriteUserProfile(uid, {
+      companyId: cid, role: 'owner', assignedPumps: [], email: userEmail||''
+    }, fsDb);
+  }).then(function(){
+    // ── Copy all business data from accounts/{uid}/... → companies/{cid}/... ──
+    // This ensures a second device can restore fully from the companies/ path
+    // without falling back to the legacy accounts/ path.
+    var src = 'accounts/'+uid;
+    var dst = 'companies/'+cid;
+    var copyPromises = [];
+
+    // global/config
+    copyPromises.push(
+      fsDb.doc(src+'/global/config').get().then(function(d){
+        if(d.exists){
+          var data = Object.assign({}, d.data(), { _migratedAt: firebase.firestore.FieldValue.serverTimestamp() });
+          return fsDb.doc(dst+'/global/config').set(data, { merge: true });
+        }
+      }).catch(function(e){ console.warn('[PetroBook SaaS] migrate global/config failed:',e.message||e); })
+    );
+
+    // global/lang
+    copyPromises.push(
+      fsDb.doc(src+'/global/lang').get().then(function(d){
+        if(d.exists){
+          var data = Object.assign({}, d.data(), { _migratedAt: firebase.firestore.FieldValue.serverTimestamp() });
+          return fsDb.doc(dst+'/global/lang').set(data, { merge: true });
+        }
+      }).catch(function(e){ console.warn('[PetroBook SaaS] migrate global/lang failed:',e.message||e); })
+    );
+
+    // pumps collection: each pump doc + its data sub-docs
+    copyPromises.push(
+      fsDb.collection(src+'/pumps').get().then(function(pumpsSnap){
+        if(pumpsSnap.empty) return;
+        var pumpCopies = [];
+        pumpsSnap.forEach(function(pDoc){
+          var pid = pDoc.id;
+          var pData = Object.assign({}, pDoc.data(), { _migratedAt: firebase.firestore.FieldValue.serverTimestamp() });
+          // Pump metadata doc
+          pumpCopies.push(
+            fsDb.doc(dst+'/pumps/'+pid).set(pData, { merge: true })
+              .catch(function(e){ console.warn('[PetroBook SaaS] migrate pump/'+pid+' failed:',e.message||e); })
+          );
+          // data/config
+          pumpCopies.push(
+            fsDb.doc(src+'/pumps/'+pid+'/data/config').get().then(function(d){
+              if(d.exists){
+                var data = Object.assign({}, d.data(), { _migratedAt: firebase.firestore.FieldValue.serverTimestamp() });
+                return fsDb.doc(dst+'/pumps/'+pid+'/data/config').set(data, { merge: true });
+              }
+            }).catch(function(e){ console.warn('[PetroBook SaaS] migrate pump/'+pid+'/data/config failed:',e.message||e); })
+          );
+          // data/snapshot
+          pumpCopies.push(
+            fsDb.doc(src+'/pumps/'+pid+'/data/snapshot').get().then(function(d){
+              if(d.exists){
+                var data = Object.assign({}, d.data(), { _migratedAt: firebase.firestore.FieldValue.serverTimestamp() });
+                return fsDb.doc(dst+'/pumps/'+pid+'/data/snapshot').set(data, { merge: true });
+              }
+            }).catch(function(e){ console.warn('[PetroBook SaaS] migrate pump/'+pid+'/data/snapshot failed:',e.message||e); })
+          );
+          // data/fuelHistory
+          pumpCopies.push(
+            fsDb.doc(src+'/pumps/'+pid+'/data/fuelHistory').get().then(function(d){
+              if(d.exists){
+                var data = Object.assign({}, d.data(), { _migratedAt: firebase.firestore.FieldValue.serverTimestamp() });
+                return fsDb.doc(dst+'/pumps/'+pid+'/data/fuelHistory').set(data, { merge: true });
+              }
+            }).catch(function(e){ console.warn('[PetroBook SaaS] migrate pump/'+pid+'/data/fuelHistory failed:',e.message||e); })
+          );
+        });
+        return Promise.all(pumpCopies);
+      }).catch(function(e){ console.warn('[PetroBook SaaS] migrate pumps collection failed:',e.message||e); })
+    );
+
+    // users collection — strip passHash (must NEVER reach Firestore)
+    copyPromises.push(
+      fsDb.collection(src+'/users').get().then(function(usersSnap){
+        if(usersSnap.empty) return;
+        var userCopies = [];
+        usersSnap.forEach(function(uDoc){
+          var uData = Object.assign({}, uDoc.data());
+          delete uData.passHash;   // SECURITY: passHash must NEVER reach Firestore
+          uData._migratedAt = firebase.firestore.FieldValue.serverTimestamp();
+          userCopies.push(
+            fsDb.doc(dst+'/users/'+uDoc.id).set(uData, { merge: true })
+              .catch(function(e){ console.warn('[PetroBook SaaS] migrate user/'+uDoc.id+' failed:',e.message||e); })
+          );
+        });
+        return Promise.all(userCopies);
+      }).catch(function(e){ console.warn('[PetroBook SaaS] migrate users collection failed:',e.message||e); })
+    );
+
+    return Promise.all(copyPromises);
+  }).then(function(){
+    // Cache companyId locally and switch path prefix
+    _pbSetCompanyId(cid);
+    if(typeof PB_FIRESTORE_PATHS !== 'undefined') PB_FIRESTORE_PATHS.useCompanies();
+    console.info('[PetroBook SaaS] Migration complete. companyId='+cid);
+    return cid;
+  }).catch(function(e){
+    console.warn('[PetroBook SaaS] Migration failed:', e.message||e);
+    return null;
+  });
+}
+
+// ── Shared restore finaliser ───────────────────────────────────────────────────
+// Called after users list is restored from Firestore (SaaS or legacy).
+// Loads global config + pumps in parallel, marks sync active, grants access.
+function _pbFinaliseRestore(me, dataRootId, role, pumpId, fbUser, fsDb, btn){
+  var prefix = (typeof PB_FIRESTORE_PATHS !== 'undefined') ? PB_FIRESTORE_PATHS.getPrefix() : 'accounts';
+  var p1 = fsDb.doc(prefix+'/'+dataRootId+'/global/config').get()
+    .then(function(d){
+      if(d.exists){
+        var g=Object.assign({},d.data()); delete g._syncedAt; delete g._v;
+        localStorage.setItem('pb-global-cfg-v1',JSON.stringify(g));
+      }
+    }).catch(function(e){ console.warn('[PetroBook] global/config read failed:',e.message||e); });
+  var p2 = fsDb.collection(prefix+'/'+dataRootId+'/pumps').get()
+    .then(function(ps){
+      if(!ps.empty){
+        var pumps=[];
+        ps.forEach(function(d){
+          var p=Object.assign({},d.data()); delete p._syncedAt; delete p._v;
+          pumps.push(p);
+        });
+        localStorage.setItem('pb-pumps-v1',JSON.stringify(pumps));
+      }
+    }).catch(function(e){ console.warn('[PetroBook] pumps read failed:',e.message||e); });
+  return Promise.all([p1,p2]).then(function(){
+    localStorage.setItem('pb-sync-active','1');
+    // Init PB_FirestoreWriter with correct root ID
+    if(typeof PB_FirestoreWriter !== 'undefined' && !PB_FirestoreWriter.isReady()){
+      PB_FirestoreWriter.init(fsDb, dataRootId);
+    } else if(typeof PB_FirestoreWriter !== 'undefined'){
+      PB_FirestoreWriter.setAccountId(dataRootId);
+    }
+    if(btn){btn.disabled=false;btn.classList.remove('loading');}
+    console.info('[PetroBook] Firebase restore complete — granting access to',me.role,me.email);
+    _doGrantAccess(me);
+  });
+}
+
+// ── Legacy accounts/ restore path ─────────────────────────────────────────────
+// Reads from accounts/{accountId}/... using JWT claims (the original flow).
+// On success: triggers background migration to companies/ so next login is SaaS-path.
+function _pbRestoreLegacyPath(fbUser, claims, email, knownCid, fsDb, btn){
+  var accountId = claims.accountId || fbUser.uid;
+  var role = claims.role||'super_owner';
+  var pumpId = claims.pumpId||null;
+  console.info('[PetroBook] Legacy restore. accountId='+accountId);
+
+  // Ensure path prefix is accounts/ for legacy reads
+  if(typeof PB_FIRESTORE_PATHS !== 'undefined') PB_FIRESTORE_PATHS.useAccounts();
+
+  return fsDb.collection('accounts/'+accountId+'/users').get()
+    .then(function(snap){
+      var usersFound=snap.size;
+      console.info('[PetroBook] LEGACY_USERS_FOUND='+usersFound);
+      if(snap.empty){
+        console.error('[PetroBook] SETUP_TRIGGER_REASON=no_users_in_firestore', {uid:fbUser.uid, accountId:accountId});
+        if(btn){btn.disabled=false;btn.classList.remove('loading');}
+        showAuthErr('login-err','Cloud account data not found. Contact support.');
+        return;
+      }
+      var users=[];
+      snap.forEach(function(doc){
+        var u=Object.assign({},doc.data()); delete u._syncedAt; delete u._v;
+        users.push(u);
+      });
+      _saveUsers(users);
+      var me=users.find(function(u){return u.email&&u.email.toLowerCase()===email;});
+      if(!me){
+        console.error('[PetroBook] SETUP_TRIGGER_REASON=email_not_in_firestore_users', {uid:fbUser.uid, accountId:accountId, email:email});
+        if(btn){btn.disabled=false;btn.classList.remove('loading');}
+        showAuthErr('login-err','Account email mismatch. Contact support.');
+        return;
+      }
+      return _pbFinaliseRestore(me, accountId, role, pumpId, fbUser, fsDb, btn).then(function(){
+        // SaaS Phase 1: background migration — create companies/ + userProfile
+        // so next login on any device uses the SaaS path. Non-blocking.
+        if(!knownCid){
+          _pbMigrateLegacyAccount(fbUser, fsDb, email).catch(function(){});
+        }
+      });
+    })
+    .catch(function(fsErr){
+      console.error('[PetroBook] SETUP_TRIGGER_REASON=firestore_read_failed', {uid:fbUser.uid, accountId:accountId, code:fsErr.code, message:fsErr.message||String(fsErr)});
+      if(btn){btn.disabled=false;btn.classList.remove('loading');}
+      if(fsErr.code==='permission-denied'){
+        showAuthErr('login-err','Your account exists but this device was denied access. Check that custom claims are set (accountId/role) and try again.');
+      } else {
+        showAuthErr('login-err','Could not restore your account ('+fsErr.code+'). Check your connection and try again.');
+      }
+    });
+}
+
 // ── Session helpers ───────────────────────────────────────────────────────────
 function _getSession(){
   // Phase 3A: sync wrapper — future: 'return await StorageService.loadSession3()'
@@ -29189,6 +29539,10 @@ function pbLogout(){
   try{closeSettings();}catch(e){}
   // Don't clear device token on logout (remember device persists)
   _clearSession();   // always — auth token must be removed on logout
+  // SaaS Phase 1: clear cached companyId so next login doesn't inherit it
+  try{ _pbSetCompanyId(null); }catch(e){}
+  // SaaS Phase 1: reset prefix to legacy default so legacy fallback path works
+  try{ if(typeof PB_FIRESTORE_PATHS!=='undefined') PB_FIRESTORE_PATHS.useAccounts(); }catch(e){}
   // Phase 6: sign out of Firebase Auth non-blocking
   try{ if(typeof PB_AuthBridge!=='undefined') PB_AuthBridge.signOutBridge().catch(function(){}); }catch(e){}
   showRoleLogin();
@@ -29258,8 +29612,91 @@ async function doSetup(){
   try{document.querySelectorAll('[id=auth-station-name]').forEach(el=>el.textContent=station);}catch(e){}
   if(btn){btn.disabled=false;btn.classList.remove('loading');}
   _doGrantAccess(newUser);
-  // Phase 6: create Firebase Auth account for new super_owner (non-blocking)
-  try{ if(typeof PB_AuthBridge!=='undefined') PB_AuthBridge.createBridge(newUser,pass).catch(function(){}); }catch(e){}
+
+  // SaaS Phase 1: Create Firebase Auth user + Firestore company + userProfile (non-blocking)
+  // 1. Try to create Firebase Auth user directly (bridge is always inactive on first setup)
+  // 2. On success: create companies/{autoId} + userProfiles/{uid} + members/{uid}
+  // 3. Cache companyId in localStorage for same-device resume
+  // 4. Switch path prefix to 'companies/' so all future writes use the new structure
+  (function(){
+    if(typeof firebase==='undefined'||!firebase.apps||!firebase.apps.length) return;
+    var fsDb = firebase.firestore();
+
+    // Step A: Create or sign-in Firebase Auth user
+    var authPromise = firebase.auth().createUserWithEmailAndPassword(email, pass)
+      .then(function(cred){ return { uid:cred.user.uid, existed:false }; })
+      .catch(function(authErr){
+        if(authErr.code==='auth/email-already-in-use'){
+          // Firebase Auth user already exists (e.g. from CI setup script)
+          return firebase.auth().signInWithEmailAndPassword(email, pass)
+            .then(function(cred){ return { uid:cred.user.uid, existed:true }; });
+        }
+        throw authErr;
+      });
+
+    authPromise.then(function(res){
+      var fbUid = res.uid;
+
+      // Step B: Check if userProfile already exists (e.g. user re-ran setup)
+      return fsDb.doc('userProfiles/'+fbUid).get().then(function(profDoc){
+        if(profDoc.exists && profDoc.data().companyId){
+          // Company already exists — just cache the companyId and switch mode
+          var existingCid = profDoc.data().companyId;
+          _pbSetCompanyId(existingCid);
+          if(typeof PB_FIRESTORE_PATHS !== 'undefined') PB_FIRESTORE_PATHS.useCompanies();
+          if(typeof PB_FirestoreWriter !== 'undefined'){
+            if(!PB_FirestoreWriter.isReady()) PB_FirestoreWriter.init(fsDb, existingCid);
+            else PB_FirestoreWriter.setAccountId(existingCid);
+          }
+          console.info('[PetroBook SaaS] Existing company found. companyId='+existingCid);
+          return;
+        }
+
+        // Step C: Create new company document with Firestore auto-ID
+        var companyRef = fsDb.collection('companies').doc();
+        var cid = companyRef.id;
+
+        return companyRef.set({
+          companyId: cid,
+          name: station,
+          ownerUid: fbUid,
+          ownerEmail: email,
+          status: 'active',
+          createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+          settings: { currency: (typeof GCFG!=='undefined'&&GCFG.currency)||'KWD' }
+        }).then(function(){
+          // Step D: Write member document
+          return fsDb.doc('companies/'+cid+'/members/'+fbUid).set({
+            uid: fbUid, role: 'owner', status: 'active',
+            assignedPumps: [],
+            joinedAt: firebase.firestore.FieldValue.serverTimestamp()
+          });
+        }).then(function(){
+          // Step E: Write userProfile (the cross-device restore key)
+          return _pbWriteUserProfile(fbUid, {
+            companyId: cid, role: 'owner', assignedPumps: [], email: email
+          }, fsDb);
+        }).then(function(){
+          // Step F: Cache + switch mode + init writer
+          _pbSetCompanyId(cid);
+          localStorage.setItem('pb-sync-active','1');
+          if(typeof PB_FIRESTORE_PATHS !== 'undefined') PB_FIRESTORE_PATHS.useCompanies();
+          if(typeof SyncEngine !== 'undefined' && typeof StorageService !== 'undefined'){
+            SyncEngine.ACTIVE = true;
+            StorageService.setProvider(SyncEngine);
+          }
+          if(typeof PB_FirestoreWriter !== 'undefined'){
+            if(!PB_FirestoreWriter.isReady()) PB_FirestoreWriter.init(fsDb, cid);
+            else PB_FirestoreWriter.setAccountId(cid);
+          }
+          if(typeof PB_AuthBridge !== 'undefined') PB_AuthBridge.activate();
+          console.info('[PetroBook SaaS] Company created. companyId='+cid+' ownerUid='+fbUid);
+        });
+      });
+    }).catch(function(e){
+      console.warn('[PetroBook SaaS] Setup Firebase step failed:', e.code||e.message||e);
+    });
+  })();
 }
 
 // ── Login ─────────────────────────────────────────────────────────────────────
@@ -29296,107 +29733,78 @@ async function doLogin(){
   }
 
   // ── Path 2: No local user — Firebase Auth restore for new/reset device ────────
-  // When pb-users-v3 is empty (new device or cleared storage), attempt Firebase Auth
-  // sign-in and restore the account from Firestore before granting access.
+  // SaaS Phase 1 restore priority:
+  //   1. userProfiles/{uid}            → get companyId → restore from companies/{cid}/...
+  //   2. legacy accounts/{accountId}/  → restore data, run migration to companies/ in bg
+  //   3. Manager: userProfiles/{uid}.companyId → restore from companies/{cid}/...
+  //
+  // The inner .catch() for Firestore is SEPARATE from the outer Firebase Auth .catch()
+  // so Firestore errors produce a distinct message (not "Incorrect email or password").
   if(!user && typeof firebase!=='undefined' && firebase.apps && firebase.apps.length){
     console.info('[PetroBook] SETUP_TRIGGER_REASON=local_user_not_found — attempting Firebase restore for email:', email);
     firebase.auth().signInWithEmailAndPassword(email, pass)
       .then(function(cred){
         var fbUser=cred.user;
         console.info('[PetroBook] AUTH_UID='+fbUser.uid);
-        // Force-refresh token so latest custom claims (accountId, role) are always present.
-        // Without forceRefresh=true, a stale cached token may have no accountId claim
-        // which causes Firestore rules to deny all reads (ownsAccount returns false).
+        // Force-refresh so latest custom claims (accountId, role, pumpId) are present.
         return fbUser.getIdTokenResult(true).then(function(tok){
           var claims=tok.claims||{};
           console.info('[PetroBook] TOKEN_CLAIMS='+JSON.stringify(claims));
-          var accountId=claims.accountId||fbUser.uid;
           var role=claims.role||'super_owner';
           var pumpId=claims.pumpId||null;
-          console.info('[PetroBook] ACCOUNT_ID='+accountId+' ROLE='+role+' PUMP_ID='+(pumpId||'none'));
           var fsDb=firebase.firestore();
-          // Load all users for this account from Firestore.
-          // This .catch() is SEPARATE from the outer Firebase Auth .catch() below so
-          // that Firestore permission-denied errors produce a distinct error message
-          // instead of "Incorrect email or password" (which was the prior bug).
-          return fsDb.collection('accounts/'+accountId+'/users').get()
-            .then(function(snap){
-              var usersFound=snap.size;
-              console.info('[PetroBook] USERS_FOUND='+usersFound);
-              if(snap.empty){
-                console.error('[PetroBook] SETUP_TRIGGER_REASON=no_users_in_firestore', {uid:fbUser.uid, accountId:accountId, configExists:false, pumpsCount:0, usersCount:0});
-                if(btn){btn.disabled=false;btn.classList.remove('loading');}
-                showAuthErr('login-err','Cloud account data not found. Contact support.');
-                return;
-              }
-              var users=[];
-              snap.forEach(function(doc){
-                var u=Object.assign({},doc.data());
-                delete u._syncedAt; delete u._v;
-                users.push(u);
-              });
-              // Restore users to localStorage
-              _saveUsers(users);
-              // Find the logged-in user in the restored list
-              var me=users.find(function(u){return u.email&&u.email.toLowerCase()===email;});
-              if(!me){
-                console.error('[PetroBook] SETUP_TRIGGER_REASON=email_not_in_firestore_users', {uid:fbUser.uid, accountId:accountId, email:email, usersCount:usersFound});
-                if(btn){btn.disabled=false;btn.classList.remove('loading');}
-                showAuthErr('login-err','Account email mismatch. Contact support.');
-                return;
-              }
-              // Load global config and pump list in parallel
-              var configExists=false;
-              var pumpsCount=0;
-              var p1=fsDb.doc('accounts/'+accountId+'/global/config').get()
-                .then(function(d){
-                  configExists=d.exists;
-                  console.info('[PetroBook] CONFIG_DOC_EXISTS='+d.exists);
-                  if(d.exists){
-                    var g=Object.assign({},d.data());
-                    delete g._syncedAt; delete g._v;
-                    localStorage.setItem('pb-global-cfg-v1',JSON.stringify(g));
+
+          // ── SaaS Phase 1: resolve companyId via userProfiles first ─────────
+          return _pbResolveUserCompany(fbUser, fsDb).then(function(resolved){
+
+            // ── 2A: SaaS company found ─────────────────────────────────────
+            if(resolved && resolved.companyId){
+              var cid = resolved.companyId;
+              console.info('[PetroBook] SaaS restore. companyId='+cid+' source='+resolved.source);
+              // Cache + switch path prefix
+              _pbSetCompanyId(cid);
+              if(typeof PB_FIRESTORE_PATHS !== 'undefined') PB_FIRESTORE_PATHS.useCompanies();
+
+              return fsDb.collection('companies/'+cid+'/users').get()
+                .then(function(snap){
+                  var usersFound=snap.size;
+                  console.info('[PetroBook] SaaS USERS_FOUND='+usersFound);
+                  // No users in companies/ yet — fall back to legacy path
+                  if(snap.empty){
+                    return _pbRestoreLegacyPath(fbUser, claims, email, cid, fsDb, btn);
                   }
-                }).catch(function(e){ console.warn('[PetroBook] global/config read failed:',e.message||e); });
-              var p2=fsDb.collection('accounts/'+accountId+'/pumps').get()
-                .then(function(ps){
-                  pumpsCount=ps.size;
-                  console.info('[PetroBook] PUMPS_FOUND='+pumpsCount);
-                  if(!ps.empty){
-                    var pumps=[];
-                    ps.forEach(function(d){
-                      var p=Object.assign({},d.data());
-                      delete p._syncedAt; delete p._v;
-                      pumps.push(p);
-                    });
-                    localStorage.setItem('pb-pumps-v1',JSON.stringify(pumps));
+                  var users=[];
+                  snap.forEach(function(doc){
+                    var u=Object.assign({},doc.data());
+                    delete u._syncedAt; delete u._v;
+                    users.push(u);
+                  });
+                  _saveUsers(users);
+                  var me=users.find(function(u){return u.email&&u.email.toLowerCase()===email;});
+                  if(!me){
+                    // Possibly a manager whose profile exists but not in companies/users —
+                    // look up by role from userProfile
+                    var fakeMeRole = resolved.role||'manager';
+                    me = { id:'restored_'+Date.now(), email:email, role:fakeMeRole,
+                           pumpId:pumpId, status:'active', name:email };
                   }
-                }).catch(function(e){ console.warn('[PetroBook] pumps read failed:',e.message||e); });
-              return Promise.all([p1,p2]).then(function(){
-                // Mark this device as sync-enabled so future boots resume Firestore sync
-                localStorage.setItem('pb-sync-active','1');
-                if(btn){btn.disabled=false;btn.classList.remove('loading');}
-                console.info('[PetroBook] Firebase restore complete — granting access to',me.role,me.email);
-                _doGrantAccess(me);
-              });
-            })
-            .catch(function(fsErr){
-              // Firestore read failed — SEPARATE from the Firebase Auth error below.
-              // Most likely: missing/stale accountId claim → Firestore rules denied.
-              // (firestore.rules v1.2 adds request.auth.uid fallback to mitigate this)
-              console.error('[PetroBook] SETUP_TRIGGER_REASON=firestore_read_failed', {uid:fbUser.uid, accountId:accountId, code:fsErr.code, message:fsErr.message||String(fsErr)});
-              if(btn){btn.disabled=false;btn.classList.remove('loading');}
-              if(fsErr.code==='permission-denied'){
-                showAuthErr('login-err','Your account exists but this device was denied access. Check that custom claims are set (accountId/role) and try again.');
-              } else {
-                showAuthErr('login-err','Could not restore your account ('+fsErr.code+'). Check your connection and try again.');
-              }
-            });
+                  return _pbFinaliseRestore(me, cid, role, pumpId, fbUser, fsDb, btn);
+                })
+                .catch(function(fsErr){
+                  console.error('[PetroBook] SaaS Firestore read failed:', fsErr.code, fsErr.message);
+                  // Fall through to legacy path
+                  return _pbRestoreLegacyPath(fbUser, claims, email, null, fsDb, btn);
+                });
+            }
+
+            // ── 2B: No SaaS company → try legacy accounts/ path ────────────
+            console.info('[PetroBook] No SaaS company found — trying legacy accounts/ path');
+            return _pbRestoreLegacyPath(fbUser, claims, email, null, fsDb, btn);
+          });
         });
       })
       .catch(function(e){
-        // Firebase Auth failure only — wrong email/password or network error.
-        // Firestore errors are caught above; this catch handles auth-layer failures.
+        // Firebase Auth failure — wrong email/password or network error.
         console.warn('[PetroBook] Firebase Auth failed:',e.code,e.message||e);
         if(btn){btn.disabled=false;btn.classList.remove('loading');}
         var l=_recordFailedAttempt();
@@ -38034,8 +38442,53 @@ async function saveUMForm(){
     };
     _saveUser(newUser);
     if(role==='manager'&&pumpId) setPumpManager(pumpId,name);
-    // Phase 6: create Firebase Auth account for new user non-blocking
-    try{ if(typeof PB_AuthBridge!=='undefined') PB_AuthBridge.createBridge(newUser,pass).catch(function(){}); }catch(e){}
+    // SaaS Phase 1: create Firebase Auth user and write userProfile for cross-device restore.
+    // Uses firebase.auth() directly when AuthBridge is inactive (most common during setup).
+    (function(capturedUser, capturedPass){
+      if(typeof firebase==='undefined'||!firebase.apps||!firebase.apps.length) return;
+      var authPromise = (typeof PB_AuthBridge!=='undefined')
+        ? PB_AuthBridge.createBridge(capturedUser, capturedPass)
+        : Promise.resolve({status:'bridge_inactive'});
+
+      authPromise.then(function(res){
+        var fbUid = (res&&res.uid) ? res.uid : null;
+
+        // Bridge was inactive — try direct Firebase Auth creation
+        if(!fbUid){
+          return firebase.auth().createUserWithEmailAndPassword(capturedUser.email, capturedPass)
+            .then(function(cred){ return cred.user.uid; })
+            .catch(function(e){
+              if(e.code==='auth/email-already-in-use'){
+                return firebase.auth().signInWithEmailAndPassword(capturedUser.email, capturedPass)
+                  .then(function(cred){ return cred.user.uid; })
+                  .catch(function(){ return null; });
+              }
+              return null;
+            });
+        }
+        return fbUid;
+      }).then(function(fbUid){
+        if(!fbUid) return;
+        var cid = _pbGetCompanyId();
+        if(!cid) return; // company not set up yet — skip userProfile write
+        var fsDb = firebase.firestore();
+        // Write manager's userProfile so they can restore on any new device
+        _pbWriteUserProfile(fbUid, {
+          companyId: cid,
+          role: capturedUser.role||'manager',
+          assignedPumps: capturedUser.pumpId ? [capturedUser.pumpId] : [],
+          email: capturedUser.email
+        }, fsDb);
+        // Also write member document
+        fsDb.doc('companies/'+cid+'/members/'+fbUid).set({
+          uid: fbUid,
+          role: capturedUser.role||'manager',
+          status: capturedUser.status||'active',
+          assignedPumps: capturedUser.pumpId ? [capturedUser.pumpId] : [],
+          joinedAt: firebase.firestore.FieldValue.serverTimestamp()
+        }, {merge:true}).catch(function(){});
+      }).catch(function(e){ console.warn('[PetroBook SaaS] Manager Firebase setup failed:', e.message||e); });
+    })(newUser, pass);
     try{showToast(name+' added as '+(role==='owner'?'Owner':'Manager')+' ✓');}catch(e){}
   } else {
     const u=_getUserById(editId);if(!u){showErr(PB18n.t('err.user_not_found'));if(btn){btn.disabled=false;btn.textContent=PB18n.t('um.save_user');}return;}
@@ -38414,27 +38867,69 @@ function _pbInitStorage(){
             PB_FirebaseAuth.onAuthStateChanged(function(fbUser){
               if(!fbUser || PB_FirestoreWriter.isReady()) return;
               console.info('[PetroBook] AUTH_UID='+fbUser.uid);
-              // Force-refresh so the latest custom claims are always reflected here
-              fbUser.getIdTokenResult(true).then(function(tokenResult){
-                var claims = tokenResult.claims||{};
-                console.info('[PetroBook] TOKEN_CLAIMS='+JSON.stringify(claims));
-                var aid = claims.accountId || fbUser.uid;
-                var role = claims.role||'(no claim)';
-                var pumpId = claims.pumpId||'(none)';
-                console.info('[PetroBook] ACCOUNT_ID='+aid+' ROLE='+role+' PUMP_ID='+pumpId);
-                var fsDb = firebase.firestore();
-                if(PB_FirestoreWriter.init(fsDb, aid)){
-                  console.info('[PetroBook] PB_FirestoreWriter initialised. accountId:', aid);
-                  // Flush any writes that were queued before writer was ready
+              var fsDb = firebase.firestore();
+
+              // SaaS Phase 1: resolve writer root ID in priority order:
+              //   1. pb-company-id cache (set during setup/login on this device)
+              //   2. userProfiles/{uid} in Firestore (cross-device key)
+              //   3. JWT claims.accountId (legacy — still works for existing accounts)
+              //   4. fbUser.uid fallback (last resort)
+              var cachedCid = _pbGetCompanyId();
+              if(cachedCid){
+                // Fast path: company ID already known from this device's login/setup
+                if(typeof PB_FIRESTORE_PATHS !== 'undefined') PB_FIRESTORE_PATHS.useCompanies();
+                if(PB_FirestoreWriter.init(fsDb, cachedCid)){
+                  console.info('[PetroBook] PB_FirestoreWriter initialised from cache. companyId:', cachedCid);
                   PB_FirestoreWriter.flush().catch(function(){});
-                  // Replay any ops that were queued while offline
                   if(typeof PB_QueueReplayEngine !== 'undefined'){
                     PB_QueueReplayEngine.replayAll(PB_FirestoreWriter).catch(function(){});
                   }
                 }
+                return;
+              }
+
+              // Slow path: look up via userProfiles or JWT claims
+              fbUser.getIdTokenResult(true).then(function(tokenResult){
+                var claims = tokenResult.claims||{};
+                console.info('[PetroBook] TOKEN_CLAIMS='+JSON.stringify(claims));
+                var role = claims.role||'(no claim)';
+                var pumpId = claims.pumpId||'(none)';
+
+                // Try userProfiles/{uid} first
+                return fsDb.doc('userProfiles/'+fbUser.uid).get().then(function(profDoc){
+                  var rootId, useCompaniesPrefix;
+                  if(profDoc.exists && profDoc.data().companyId){
+                    rootId = profDoc.data().companyId;
+                    useCompaniesPrefix = true;
+                    _pbSetCompanyId(rootId); // cache for future fast-path
+                    console.info('[PetroBook] PB_FirestoreWriter rootId from userProfile:', rootId);
+                  } else {
+                    // Fall back to JWT claims (legacy accounts/ path)
+                    rootId = claims.accountId || fbUser.uid;
+                    useCompaniesPrefix = false;
+                    console.info('[PetroBook] PB_FirestoreWriter rootId from claims:', rootId);
+                  }
+                  if(typeof PB_FIRESTORE_PATHS !== 'undefined'){
+                    useCompaniesPrefix ? PB_FIRESTORE_PATHS.useCompanies() : PB_FIRESTORE_PATHS.useAccounts();
+                  }
+                  console.info('[PetroBook] ACCOUNT_ID='+rootId+' ROLE='+role+' PUMP_ID='+pumpId);
+                  if(PB_FirestoreWriter.init(fsDb, rootId)){
+                    console.info('[PetroBook] PB_FirestoreWriter initialised. rootId:', rootId);
+                    PB_FirestoreWriter.flush().catch(function(){});
+                    if(typeof PB_QueueReplayEngine !== 'undefined'){
+                      PB_QueueReplayEngine.replayAll(PB_FirestoreWriter).catch(function(){});
+                    }
+                  }
+                }).catch(function(profileErr){
+                  // userProfile read failed — fall back to JWT claims
+                  var aid = claims.accountId || fbUser.uid;
+                  console.warn('[PetroBook] userProfile read failed, using claims.accountId:', profileErr.message||profileErr);
+                  if(PB_FirestoreWriter.init(fsDb, aid)){
+                    PB_FirestoreWriter.flush().catch(function(){});
+                  }
+                });
               }).catch(function(e){
-                // Fallback: no custom claims yet — use Firebase UID directly
-                var fsDb = firebase.firestore();
+                // No custom claims — use Firebase UID directly
                 PB_FirestoreWriter.init(fsDb, fbUser.uid);
                 console.warn('[PetroBook] Auth claims unavailable, using fbUser.uid as accountId:', e);
                 PB_FirestoreWriter.flush().catch(function(){});
