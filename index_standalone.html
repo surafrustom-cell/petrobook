@@ -29723,8 +29723,25 @@ async function doLogin(){
     if(user.status==='inactive'){showAuthErr('login-err','Account is disabled. Contact the Super Owner.');return;}
     if(user.role==='manager'&&!user.pumpId){showAuthErr('login-err','No pump assigned. Contact the owner.');return;}
     _doGrantAccess(user);
-    // Phase 6: sign in to Firebase Auth non-blocking — never delays or blocks local login
-    try{ if(typeof PB_AuthBridge!=='undefined') PB_AuthBridge.signInBridge(email,pass).catch(function(){}); }catch(e){}
+    // Phase 6: sign in to Firebase Auth non-blocking — never delays or blocks local login.
+    // If Firebase Auth has a stale/admin-set password, updatePassword() syncs it to the
+    // user's local password so cross-device restore works next time.
+    try{
+      if(typeof PB_AuthBridge!=='undefined'){
+        PB_AuthBridge.signInBridge(email,pass).catch(function(e){
+          if(e&&(e.code==='auth/wrong-password'||e.code==='auth/invalid-credential')){
+            var cu=typeof firebase!=='undefined'&&firebase.auth&&firebase.auth().currentUser;
+            if(cu){
+              cu.updatePassword(pass).then(function(){
+                console.info('[PetroBook] Firebase Auth password synced to local password.');
+              }).catch(function(upErr){
+                console.warn('[PetroBook] Could not sync Firebase Auth password:',upErr.code);
+              });
+            }
+          }
+        });
+      }
+    }catch(e){}
     // BUG-M1: warn if login succeeded using a weak DJB2 hash (registered on HTTP)
     if(user.passHash&&user.passHash.startsWith('fb')){
       setTimeout(function(){try{showToast('⚠️ Password uses a weak hash. Please update it in Settings → Change Password.');}catch(e){}},2500);
@@ -29740,7 +29757,7 @@ async function doLogin(){
   //
   // The inner .catch() for Firestore is SEPARATE from the outer Firebase Auth .catch()
   // so Firestore errors produce a distinct message (not "Incorrect email or password").
-  if(!user && typeof firebase!=='undefined' && firebase.apps && firebase.apps.length){
+  if((!user||!user.passHash) && typeof firebase!=='undefined' && firebase.apps && firebase.apps.length){
     console.info('[PetroBook] SETUP_TRIGGER_REASON=local_user_not_found — attempting Firebase restore for email:', email);
     firebase.auth().signInWithEmailAndPassword(email, pass)
       .then(function(cred){
@@ -29780,7 +29797,8 @@ async function doLogin(){
                       var synthUser = {
                         id: 'restored_'+Date.now(), email: email,
                         role: synthRole, pumpId: claims.pumpId||null,
-                        status: 'active', name: email
+                        status: 'active', name: email,
+                        passHash: passHash  // stamp so next local login works without Firebase Auth
                       };
                       _saveUsers([synthUser]);
                       return _pbFinaliseRestore(synthUser, cid, synthRole, claims.pumpId||null, fbUser, fsDb, btn);
@@ -29793,14 +29811,15 @@ async function doLogin(){
                     delete u._syncedAt; delete u._v;
                     users.push(u);
                   });
-                  _saveUsers(users);
                   var me=users.find(function(u){return u.email&&u.email.toLowerCase()===email;});
+                  if(me){ me.passHash=passHash; } // stamp so next local login works without Firebase Auth
+                  _saveUsers(users);
                   if(!me){
                     // Possibly a manager whose profile exists but not in companies/users —
                     // look up by role from userProfile
                     var fakeMeRole = resolved.role||'manager';
                     me = { id:'restored_'+Date.now(), email:email, role:fakeMeRole,
-                           pumpId:pumpId, status:'active', name:email };
+                           pumpId:pumpId, status:'active', name:email, passHash:passHash };
                   }
                   return _pbFinaliseRestore(me, cid, role, pumpId, fbUser, fsDb, btn);
                 })
