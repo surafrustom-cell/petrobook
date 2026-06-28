@@ -29279,20 +29279,117 @@ async function doLogin(){
   if(btn){btn.disabled=true;btn.classList.add('loading');}
   const passHash=await _hashPass(pass);
   const user=_getUserByEmail(email);
-  if(btn){btn.disabled=false;btn.classList.remove('loading');}
+
+  // ── Path 1: Local user found and password matches ─────────────────────────────
   if(user&&user.passHash===passHash){
+    if(btn){btn.disabled=false;btn.classList.remove('loading');}
     if(user.status==='inactive'){showAuthErr('login-err','Account is disabled. Contact the Super Owner.');return;}
     if(user.role==='manager'&&!user.pumpId){showAuthErr('login-err','No pump assigned. Contact the owner.');return;}
     _doGrantAccess(user);
     // Phase 6: sign in to Firebase Auth non-blocking — never delays or blocks local login
     try{ if(typeof PB_AuthBridge!=='undefined') PB_AuthBridge.signInBridge(email,pass).catch(function(){}); }catch(e){}
     // BUG-M1: warn if login succeeded using a weak DJB2 hash (registered on HTTP)
-    // Non-blocking — shown after access is granted, never before.
     if(user.passHash&&user.passHash.startsWith('fb')){
       setTimeout(function(){try{showToast('⚠️ Password uses a weak hash. Please update it in Settings → Change Password.');}catch(e){}},2500);
     }
     return;
   }
+
+  // ── Path 2: No local user — Firebase Auth restore for new/reset device ────────
+  // When pb-users-v3 is empty (new device or cleared storage), attempt Firebase Auth
+  // sign-in and restore the account from Firestore before granting access.
+  if(!user && typeof firebase!=='undefined' && firebase.apps && firebase.apps.length){
+    console.info('[PetroBook] SETUP_TRIGGER_REASON=local_user_not_found — attempting Firebase restore for email:', email);
+    firebase.auth().signInWithEmailAndPassword(email, pass)
+      .then(function(cred){
+        var fbUser=cred.user;
+        console.info('[PetroBook] AUTH_UID='+fbUser.uid);
+        return fbUser.getIdTokenResult().then(function(tok){
+          var claims=tok.claims||{};
+          var accountId=claims.accountId||fbUser.uid;
+          var role=claims.role||'super_owner';
+          var pumpId=claims.pumpId||null;
+          console.info('[PetroBook] ACCOUNT_ID='+accountId+' ROLE='+role+' PUMP_ID='+(pumpId||'none'));
+          var fsDb=firebase.firestore();
+          // Load all users for this account from Firestore
+          return fsDb.collection('accounts/'+accountId+'/users').get()
+            .then(function(snap){
+              var found=!snap.empty;
+              console.info('[PetroBook] CONFIG_FOUND='+found+' user_count='+snap.size);
+              if(!found){
+                console.warn('[PetroBook] SETUP_TRIGGER_REASON=no_users_in_firestore — accountId:'+accountId);
+                if(btn){btn.disabled=false;btn.classList.remove('loading');}
+                showAuthErr('login-err','Cloud account data not found. Contact support.');
+                return;
+              }
+              var users=[];
+              snap.forEach(function(doc){
+                var u=Object.assign({},doc.data());
+                delete u._syncedAt; delete u._v;
+                users.push(u);
+              });
+              // Restore users to localStorage
+              _saveUsers(users);
+              // Find the logged-in user in the restored list
+              var me=users.find(function(u){return u.email&&u.email.toLowerCase()===email;});
+              if(!me){
+                console.warn('[PetroBook] SETUP_TRIGGER_REASON=email_not_in_firestore_users — email:'+email);
+                if(btn){btn.disabled=false;btn.classList.remove('loading');}
+                showAuthErr('login-err','Account email mismatch. Contact support.');
+                return;
+              }
+              // Load global config and pump list in parallel
+              var p1=fsDb.doc('accounts/'+accountId+'/global/config').get()
+                .then(function(d){
+                  if(d.exists){
+                    var g=Object.assign({},d.data());
+                    delete g._syncedAt; delete g._v;
+                    localStorage.setItem('pb-global-cfg-v1',JSON.stringify(g));
+                    console.info('[PetroBook] Restored global config from Firestore');
+                  }
+                }).catch(function(e){ console.warn('[PetroBook] global/config read failed:',e.message||e); });
+              var p2=fsDb.collection('accounts/'+accountId+'/pumps').get()
+                .then(function(ps){
+                  if(!ps.empty){
+                    var pumps=[];
+                    ps.forEach(function(d){
+                      var p=Object.assign({},d.data());
+                      delete p._syncedAt; delete p._v;
+                      pumps.push(p);
+                    });
+                    localStorage.setItem('pb-pumps-v1',JSON.stringify(pumps));
+                    console.info('[PetroBook] Restored '+pumps.length+' pump(s) from Firestore');
+                  }
+                }).catch(function(e){ console.warn('[PetroBook] pumps read failed:',e.message||e); });
+              return Promise.all([p1,p2]).then(function(){
+                // Mark this device as sync-enabled so future boots resume Firestore sync
+                localStorage.setItem('pb-sync-active','1');
+                if(btn){btn.disabled=false;btn.classList.remove('loading');}
+                console.info('[PetroBook] Firebase restore complete — granting access to',me.role,me.email);
+                _doGrantAccess(me);
+              });
+            });
+        });
+      })
+      .catch(function(e){
+        console.warn('[PetroBook] Firebase restore failed:',e.code,e.message||e);
+        if(btn){btn.disabled=false;btn.classList.remove('loading');}
+        // Wrong Firebase password counts as a failed attempt
+        var l=_recordFailedAttempt();
+        if(l.until){
+          const lkEl=document.getElementById('login-lockout');
+          if(lkEl){lkEl.textContent='Account locked for 5 minutes after too many failed attempts.';lkEl.classList.add('show');}
+          showAuthErr('login-err','');
+        } else {
+          const rem=MAX_ATTEMPTS-l.attempts;
+          showAuthErr('login-err','Incorrect email or password.'+(rem<3?' ('+rem+' attempts left)':''));
+        }
+      });
+    return; // async path — exit sync function
+  }
+
+  // ── Path 3: Local user exists but password is wrong ───────────────────────────
+  if(btn){btn.disabled=false;btn.classList.remove('loading');}
   const l=_recordFailedAttempt();
   if(l.until){
     const lkEl=document.getElementById('login-lockout');
@@ -38292,8 +38389,13 @@ function _pbInitStorage(){
           if(typeof PB_FirebaseAuth !== 'undefined' && typeof PB_FirestoreWriter !== 'undefined'){
             PB_FirebaseAuth.onAuthStateChanged(function(fbUser){
               if(!fbUser || PB_FirestoreWriter.isReady()) return;
+              console.info('[PetroBook] AUTH_UID='+fbUser.uid);
               fbUser.getIdTokenResult().then(function(tokenResult){
-                var aid = (tokenResult.claims && tokenResult.claims.accountId) || fbUser.uid;
+                var claims = tokenResult.claims||{};
+                var aid = claims.accountId || fbUser.uid;
+                var role = claims.role||'(no claim)';
+                var pumpId = claims.pumpId||'(none)';
+                console.info('[PetroBook] ACCOUNT_ID='+aid+' ROLE='+role+' PUMP_ID='+pumpId);
                 var fsDb = firebase.firestore();
                 if(PB_FirestoreWriter.init(fsDb, aid)){
                   console.info('[PetroBook] PB_FirestoreWriter initialised. accountId:', aid);
@@ -38346,6 +38448,7 @@ window.addEventListener('load', function(){
     //   if(_isSessionExpiredFrom(ctx)) { ... }
     // For now: sync reads are used directly.
     if(typeof _isSessionExpired === 'function' && _isSessionExpired()){
+      console.info('[PetroBook] SETUP_TRIGGER_REASON=session_expired');
       try{ _clearSession(); }catch(e){}
       try{ showRoleLogin(); }catch(e){ console.error('[PetroBook login]',e); }
       return;
@@ -38356,6 +38459,7 @@ window.addEventListener('load', function(){
 
     // ── Step 3: No session at all → show login ────────────────────────────
     if(!role){
+      console.info('[PetroBook] SETUP_TRIGGER_REASON=no_role_in_localstorage — new device or cleared storage');
       try{ showRoleLogin(); }catch(e){ console.error('[PetroBook login]',e); }
       return;
     }
