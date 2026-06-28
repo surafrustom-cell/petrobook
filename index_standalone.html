@@ -39182,42 +39182,58 @@ function closeCurrencyPicker(){
 
 </script>
 
-<!-- ══ DIAGNOSTIC MEASUREMENT LOGGER — REMOVE AFTER ROOT CAUSE FOUND ══ -->
+<!-- ══ DIAGNOSTIC OVERLAY — shows measurements on screen, no DevTools needed ══ -->
+<div id="pb-diag-overlay" style="
+  position:fixed;top:0;left:0;right:0;z-index:99999;
+  background:rgba(0,0,0,.92);color:#0f0;font:11px/1.5 monospace;
+  padding:6px 8px;max-height:50vh;overflow-y:auto;
+  pointer-events:auto;touch-action:pan-y;
+  display:none;
+"></div>
+<button id="pb-diag-btn" onclick="window.pbDiagShow()" style="
+  position:fixed;bottom:60px;right:10px;z-index:99999;
+  background:#e11;color:#fff;border:none;border-radius:6px;
+  padding:8px 12px;font:bold 13px sans-serif;
+  box-shadow:0 2px 8px rgba(0,0,0,.5);
+">DIAG</button>
 <script>
 (function(){
-  function pbDiag(label){
-    var activePg  = document.querySelector('.pg.pg-active');
+  function pbDiagShow(){
+    var activePg     = document.querySelector('.pg.pg-active');
     var activeScroll = activePg ? activePg.querySelector('.pg-scroll') : null;
-    var cs = getComputedStyle(document.documentElement);
-    console.log('[PB-DIAG] '+label);
-    console.table({
-      innerHeight:              window.innerHeight,
-      outerHeight:              window.outerHeight,
-      visualViewportHeight:     window.visualViewport ? window.visualViewport.height    : 'n/a',
-      visualViewportOffsetTop:  window.visualViewport ? window.visualViewport.offsetTop  : 'n/a',
-      visualViewportOffsetLeft: window.visualViewport ? window.visualViewport.offsetLeft : 'n/a',
-      htmlClientHeight:         document.documentElement.clientHeight,
-      htmlScrollHeight:         document.documentElement.scrollHeight,
-      bodyClientHeight:         document.body.clientHeight,
-      bodyScrollHeight:         document.body.scrollHeight,
-      appHeight:                (document.querySelector('.app')||{getBoundingClientRect:function(){return{height:'n/a'}}}).getBoundingClientRect().height,
-      activePageId:             activePg ? activePg.id : 'none',
-      activePageHeight:         activePg  ? activePg.getBoundingClientRect().height  : 'n/a',
-      activeScrollHeight:       activeScroll ? activeScroll.getBoundingClientRect().height : 'n/a',
-      activeScrollScrollHeight: activeScroll ? activeScroll.scrollHeight : 'n/a',
-      safeTop:                  cs.getPropertyValue('--safe-top').trim(),
-      safeBottom:               cs.getPropertyValue('--safe-bottom').trim()
-    });
+    var loginEl      = document.getElementById('pb-login');
+    var cs           = getComputedStyle(document.documentElement);
+    var rows = [
+      ['innerHeight',              window.innerHeight],
+      ['outerHeight',              window.outerHeight],
+      ['vvp.height',               window.visualViewport ? window.visualViewport.height : 'n/a'],
+      ['vvp.offsetTop',            window.visualViewport ? window.visualViewport.offsetTop : 'n/a'],
+      ['html.clientHeight',        document.documentElement.clientHeight],
+      ['html.scrollHeight',        document.documentElement.scrollHeight],
+      ['body.clientHeight',        document.body.clientHeight],
+      ['body.scrollHeight',        document.body.scrollHeight],
+      ['app.height',               (document.querySelector('.app')||{getBoundingClientRect:function(){return{height:'n/a'}}}).getBoundingClientRect().height],
+      ['activePg.id',              activePg ? activePg.id : 'NONE'],
+      ['activePg.height',          activePg ? +activePg.getBoundingClientRect().height.toFixed(1) : 'n/a'],
+      ['activePg.bottom(rect)',     activePg ? +activePg.getBoundingClientRect().bottom.toFixed(1) : 'n/a'],
+      ['pgScroll.height',          activeScroll ? +activeScroll.getBoundingClientRect().height.toFixed(1) : 'n/a'],
+      ['pgScroll.scrollHeight',    activeScroll ? activeScroll.scrollHeight : 'n/a'],
+      ['pbLogin.height',           loginEl ? +loginEl.getBoundingClientRect().height.toFixed(1) : 'n/a'],
+      ['pbLogin.bottom(rect)',      loginEl ? +loginEl.getBoundingClientRect().bottom.toFixed(1) : 'n/a'],
+      ['--safe-top',               cs.getPropertyValue('--safe-top').trim()],
+      ['--safe-bottom',            cs.getPropertyValue('--safe-bottom').trim()],
+      ['safeAreaBottom(env)',       CSS.supports('padding','env(safe-area-inset-bottom)') ? 'supported' : 'NO'],
+    ];
+    var html = '<b style="color:#ff0">PB-DIAG — tap CLOSE to dismiss</b><br>';
+    rows.forEach(function(r){ html += '<span style="color:#aaa">'+r[0]+'</span>: <b>'+r[1]+'</b><br>'; });
+    html += '<br><button onclick="document.getElementById(\'pb-diag-overlay\').style.display=\'none\'" style="background:#333;color:#fff;border:none;padding:4px 10px;border-radius:4px">CLOSE</button>';
+    var el = document.getElementById('pb-diag-overlay');
+    el.innerHTML = html;
+    el.style.display = 'block';
   }
-  // Fire on load
-  window.addEventListener('load', function(){ setTimeout(function(){ pbDiag('load'); }, 500); });
-  // Fire on resize (address bar show/hide, orientation change)
-  window.addEventListener('resize', function(){ pbDiag('resize'); });
-  if(window.visualViewport){
-    window.visualViewport.addEventListener('resize', function(){ pbDiag('visualViewport-resize'); });
-  }
-  // Expose globally so you can call pbDiag('manual') from console anytime
-  window.pbDiag = pbDiag;
+  window.pbDiagShow = pbDiagShow;
+  // Also auto-run on load so values are ready
+  window.addEventListener('load', function(){ setTimeout(pbDiagShow, 800); });
 })();
 </script>
 <!-- ══ END DIAGNOSTIC ══ -->
