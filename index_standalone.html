@@ -8427,8 +8427,13 @@ tr:last-child td{border-bottom:none}
 #cfg-currency-row.cur-open .st-arr svg {
   transform: rotate(90deg); transition: transform .2s;
 }
-
-
+/* ══ DIAGNOSTIC LAYER COLORS — REMOVE AFTER ROOT CAUSE FOUND ══ */
+html { background:red !important; }
+body { background:green !important; }
+.app { background:blue !important; }
+.pg.pg-active { background:yellow !important; }
+.pg-scroll { background:pink !important; }
+/* ══ END DIAGNOSTIC ══ */
 
 
 </style>
@@ -39176,5 +39181,45 @@ function closeCurrencyPicker(){
    ══════════════════════════════════════════════════════════════════════ */
 
 </script>
+
+<!-- ══ DIAGNOSTIC MEASUREMENT LOGGER — REMOVE AFTER ROOT CAUSE FOUND ══ -->
+<script>
+(function(){
+  function pbDiag(label){
+    var activePg  = document.querySelector('.pg.pg-active');
+    var activeScroll = activePg ? activePg.querySelector('.pg-scroll') : null;
+    var cs = getComputedStyle(document.documentElement);
+    console.log('[PB-DIAG] '+label);
+    console.table({
+      innerHeight:              window.innerHeight,
+      outerHeight:              window.outerHeight,
+      visualViewportHeight:     window.visualViewport ? window.visualViewport.height    : 'n/a',
+      visualViewportOffsetTop:  window.visualViewport ? window.visualViewport.offsetTop  : 'n/a',
+      visualViewportOffsetLeft: window.visualViewport ? window.visualViewport.offsetLeft : 'n/a',
+      htmlClientHeight:         document.documentElement.clientHeight,
+      htmlScrollHeight:         document.documentElement.scrollHeight,
+      bodyClientHeight:         document.body.clientHeight,
+      bodyScrollHeight:         document.body.scrollHeight,
+      appHeight:                (document.querySelector('.app')||{getBoundingClientRect:function(){return{height:'n/a'}}}).getBoundingClientRect().height,
+      activePageId:             activePg ? activePg.id : 'none',
+      activePageHeight:         activePg  ? activePg.getBoundingClientRect().height  : 'n/a',
+      activeScrollHeight:       activeScroll ? activeScroll.getBoundingClientRect().height : 'n/a',
+      activeScrollScrollHeight: activeScroll ? activeScroll.scrollHeight : 'n/a',
+      safeTop:                  cs.getPropertyValue('--safe-top').trim(),
+      safeBottom:               cs.getPropertyValue('--safe-bottom').trim()
+    });
+  }
+  // Fire on load
+  window.addEventListener('load', function(){ setTimeout(function(){ pbDiag('load'); }, 500); });
+  // Fire on resize (address bar show/hide, orientation change)
+  window.addEventListener('resize', function(){ pbDiag('resize'); });
+  if(window.visualViewport){
+    window.visualViewport.addEventListener('resize', function(){ pbDiag('visualViewport-resize'); });
+  }
+  // Expose globally so you can call pbDiag('manual') from console anytime
+  window.pbDiag = pbDiag;
+})();
+</script>
+<!-- ══ END DIAGNOSTIC ══ -->
 </body>
 </html>
