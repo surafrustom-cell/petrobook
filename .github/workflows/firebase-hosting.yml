@@ -33,6 +33,41 @@ jobs:
         with:
           credentials_json: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
 
+      # Deploy Firestore security rules via the Firebase Rules REST API.
+      # This ensures ownsAccount() uid-fallback (v1.2+) and isMemberOf() (v2.0)
+      # are always live so cross-device login works without custom claims.
+      - name: Deploy Firestore security rules
+        run: |
+          TOKEN=$(gcloud auth print-access-token)
+          PROJECT="${{ secrets.FIREBASE_PROJECT_ID }}"
+          RULES_CONTENT=$(cat firestore.rules)
+          BODY=$(jq -n --arg src "$RULES_CONTENT" \
+            '{"source":{"files":[{"name":"firestore.rules","content":$src}]}}')
+          HTTP=$(curl -s -o /tmp/rules_response.json -w "%{http_code}" -X POST \
+            "https://firebaserules.googleapis.com/v1/projects/${PROJECT}/rulesets" \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$BODY")
+          echo "Ruleset create: HTTP ${HTTP}"
+          if [[ "$HTTP" != "200" ]]; then
+            echo "ERROR creating ruleset:"; cat /tmp/rules_response.json; exit 1
+          fi
+          RULESET_NAME=$(jq -r '.name' /tmp/rules_response.json)
+          echo "Ruleset: ${RULESET_NAME}"
+          RELEASE_BODY=$(jq -n --arg rs "$RULESET_NAME" \
+            '{"release":{"name":"projects/'"${PROJECT}"'/releases/cloud.firestore","rulesetName":$rs}}')
+          HTTP2=$(curl -s -o /tmp/release_response.json -w "%{http_code}" \
+            -X PATCH \
+            "https://firebaserules.googleapis.com/v1/projects/${PROJECT}/releases/cloud.firestore" \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$RELEASE_BODY")
+          echo "Release update: HTTP ${HTTP2}"
+          if [[ "$HTTP2" != "200" ]]; then
+            echo "ERROR updating release:"; cat /tmp/release_response.json; exit 1
+          fi
+          echo "Firestore security rules deployed successfully."
+
       # Attempt Firestore composite index creation via REST API.
       # 200=created, 409=already exists, 403=missing permission -- all treated as OK.
       # Grant roles/datastore.owner to firebase-adminsdk SA to make 403s go away.

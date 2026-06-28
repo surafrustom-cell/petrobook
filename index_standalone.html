@@ -29769,8 +29769,22 @@ async function doLogin(){
                 .then(function(snap){
                   var usersFound=snap.size;
                   console.info('[PetroBook] SaaS USERS_FOUND='+usersFound);
-                  // No users in companies/ yet — fall back to legacy path
+                  // No users in companies/ yet.
+                  // If we resolved this user via userProfile or companyQuery, restore
+                  // them directly from that data — avoids falling to the legacy path
+                  // where old Firestore rules may deny access due to missing claims.
                   if(snap.empty){
+                    if(resolved && resolved.companyId && resolved.role){
+                      console.info('[PetroBook] SaaS: companies/users empty — restoring from userProfile. role='+resolved.role);
+                      var synthRole = resolved.role || claims.role || 'owner';
+                      var synthUser = {
+                        id: 'restored_'+Date.now(), email: email,
+                        role: synthRole, pumpId: claims.pumpId||null,
+                        status: 'active', name: email
+                      };
+                      _saveUsers([synthUser]);
+                      return _pbFinaliseRestore(synthUser, cid, synthRole, claims.pumpId||null, fbUser, fsDb, btn);
+                    }
                     return _pbRestoreLegacyPath(fbUser, claims, email, cid, fsDb, btn);
                   }
                   var users=[];
