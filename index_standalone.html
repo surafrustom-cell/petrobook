@@ -29054,14 +29054,31 @@ function _pbFinaliseRestore(me, dataRootId, role, pumpId, fbUser, fsDb, btn){
     }).catch(function(e){ console.warn('[PetroBook] pumps read failed:',e.message||e); });
   return Promise.all([p1,p2]).then(function(){
     localStorage.setItem('pb-sync-active','1');
+    // Auth v3: activate SyncEngine + switch StorageService to sync mode.
+    // Must happen BEFORE PB_FirestoreWriter.init() so queued writes flush correctly.
+    // (doSetup() also does this — replicate here for cross-device restore path.)
+    try{
+      if(typeof SyncEngine !== 'undefined') SyncEngine.ACTIVE = true;
+      if(typeof StorageService !== 'undefined' && typeof SyncEngine !== 'undefined'){
+        StorageService.setProvider(SyncEngine);
+      }
+      if(typeof PB_AuthBridge !== 'undefined') PB_AuthBridge.activate();
+    }catch(syncErr){ console.warn('[PetroBook] SyncEngine activation (non-fatal):',syncErr.message||syncErr); }
     // Init PB_FirestoreWriter with correct root ID
     if(typeof PB_FirestoreWriter !== 'undefined' && !PB_FirestoreWriter.isReady()){
       PB_FirestoreWriter.init(fsDb, dataRootId);
     } else if(typeof PB_FirestoreWriter !== 'undefined'){
       PB_FirestoreWriter.setAccountId(dataRootId);
     }
+    // Flush any offline queue accumulated during restore
+    try{
+      if(typeof PB_FirestoreWriter !== 'undefined') PB_FirestoreWriter.flush().catch(function(){});
+      if(typeof PB_QueueReplayEngine !== 'undefined' && typeof PB_FirestoreWriter !== 'undefined'){
+        PB_QueueReplayEngine.replayAll(PB_FirestoreWriter).catch(function(){});
+      }
+    }catch(e){}
     if(btn){btn.disabled=false;btn.classList.remove('loading');}
-    console.info('[PetroBook] Firebase restore complete — granting access to',me.role,me.email);
+    console.info('[PetroBook] v3 Firebase restore complete — granting access to',me.role,me.email);
     _doGrantAccess(me);
   });
 }
@@ -29864,87 +29881,131 @@ async function doGoogleLogin(){
   }
 }
 
-// ── Shared Firebase restore — called after ANY successful Firebase sign-in ────
-// Works for email/password, Google SSO, and future providers.
-// Resolution order: userProfiles/{uid} → companies query → legacy accounts/.
-// No passHash dependency at any stage.
+// ── Auth v3: Shared Firebase restore ─────────────────────────────────────────
+// Called after ANY successful Firebase sign-in (email/password, Google, future).
+//
+// v3 architecture (Firebase UID is the ONLY owner identity source):
+//   Firebase Auth UID
+//     → userProfiles/{uid}  (cross-device restore key)
+//     → companyId
+//     → ensure member doc exists (self-heal)
+//     → load config + pumps from Firestore
+//     → grant access
+//
+// REMOVED in v3:
+//   • companies/{cid}/users collection read for authentication (was causing
+//     permission-denied → "Cloud account data not found" when member doc missing)
+//   • passHash dependency at any stage
+//   • Firestore users-collection read failure → legacy fallback cascade
+//
 function _pbHandleFirebaseUser(fbUser, btn){
-  var email=fbUser.email;
-  console.info('[PetroBook] AUTH_UID='+fbUser.uid+' email='+email);
-  // Force-refresh so latest custom claims are present
+  var uid=fbUser.uid;
+  var email=fbUser.email||'';
+  var displayName=fbUser.displayName||email;
+  console.info('[PetroBook] v3 AUTH_UID='+uid+' email='+email);
+  var fsDb=firebase.firestore();
+
+  // Force-refresh token so latest custom claims are always present
   return fbUser.getIdTokenResult(true).then(function(tok){
     var claims=tok.claims||{};
     console.info('[PetroBook] TOKEN_CLAIMS='+JSON.stringify(claims));
-    var fsDb=firebase.firestore();
 
     return _pbResolveUserCompany(fbUser, fsDb).then(function(resolved){
 
-      // ── SaaS path: companyId found via userProfiles or companyQuery ───────
+      // ── SaaS path ─────────────────────────────────────────────────────────
+      // companyId resolved from userProfiles/{uid} or companies ownerUid query.
+      // Owner identity = Firebase Auth UID. No Firestore users lookup needed.
       if(resolved && resolved.companyId){
         var cid=resolved.companyId;
-        console.info('[PetroBook] SaaS restore. companyId='+cid+' source='+resolved.source);
+        var role=resolved.role||claims.role||'owner';
+        console.info('[PetroBook] v3 restore. companyId='+cid+' role='+role+' source='+resolved.source);
+
+        // Set company context
         _pbSetCompanyId(cid);
         if(typeof PB_FIRESTORE_PATHS!=='undefined') PB_FIRESTORE_PATHS.useCompanies();
 
-        return fsDb.collection('companies/'+cid+'/users').get()
-          .then(function(snap){
-            var role=resolved.role||claims.role||'owner';
-            var pumpId=claims.pumpId||null;
+        // Build owner user object from Firebase Auth — no Firestore users read
+        var ownerUser={
+          id:uid, uid:uid,
+          email:email, name:displayName,
+          role:role, pumpId:claims.pumpId||null,
+          status:'active', firebaseUid:uid
+        };
+        _saveUsers([ownerUser]);
 
-            if(snap.empty){
-              // No users doc — restore from userProfile metadata
-              if(resolved.role){
-                console.info('[PetroBook] SaaS: companies/users empty — restoring from userProfile. role='+resolved.role);
-                var synthUser={
-                  id:'restored_'+Date.now(), email:email,
-                  role:resolved.role, pumpId:claims.pumpId||null,
-                  status:'active', name:fbUser.displayName||email
-                };
-                _saveUsers([synthUser]);
-                return _pbFinaliseRestore(synthUser, cid, resolved.role, claims.pumpId||null, fbUser, fsDb, btn);
-              }
-              return _pbRestoreLegacyPath(fbUser, claims, email, cid, fsDb, btn);
-            }
-
-            var users=[];
-            snap.forEach(function(doc){
-              var u=Object.assign({},doc.data()); delete u._syncedAt; delete u._v;
-              users.push(u);
-            });
-            var me=users.find(function(u){return u.email&&u.email.toLowerCase()===email;});
-            if(!me){
-              var fakeMeRole=resolved.role||'owner';
-              me={id:'restored_'+Date.now(),email:email,role:fakeMeRole,
-                  pumpId:pumpId,status:'active',name:fbUser.displayName||email};
-            }
-            _saveUsers(users);
-            return _pbFinaliseRestore(me, cid, role, pumpId, fbUser, fsDb, btn);
-          })
-          .catch(function(fsErr){
-            console.error('[PetroBook] SaaS Firestore read failed:',fsErr.code,fsErr.message);
-            return _pbRestoreLegacyPath(fbUser, claims, email, null, fsDb, btn);
+        // Ensure member doc exists BEFORE reading company Firestore data.
+        // isMemberOf() in Firestore rules requires exists(members/{uid}).
+        // _pbEnsureMemberDoc() uses isOwnerOf() which doesn't require member doc.
+        return _pbEnsureMemberDoc(uid, cid, role, email, displayName, fsDb)
+          .then(function(){
+            return _pbFinaliseRestore(ownerUser, cid, role, claims.pumpId||null, fbUser, fsDb, btn);
           });
       }
 
-      // ── No SaaS company found ─────────────────────────────────────────────
-      // New Google users with no existing company → show company creation flow.
+      // ── No company found ──────────────────────────────────────────────────
+      // Legacy account (found in accounts/{uid}/users only) → migrate
+      if(resolved && resolved.source==='legacyAccount'){
+        console.info('[PetroBook] v3: legacy account — restoring + migrating. uid='+uid);
+        return _pbRestoreLegacyPath(fbUser, claims, email, null, fsDb, btn);
+      }
+
+      // New Google user → company creation onboarding
       var isGoogle=fbUser.providerData&&
         fbUser.providerData.some(function(p){return p.providerId==='google.com';});
-      if(isGoogle && resolved===null){
-        console.info('[PetroBook] New Google user — no company. Showing onboarding.');
+      if(isGoogle){
+        console.info('[PetroBook] v3: New Google user — no company. Showing onboarding.');
         if(btn){btn.disabled=false;btn.classList.remove('loading');}
         _pbShowGoogleOnboarding(fbUser);
         return;
       }
 
-      // Email/password users with no SaaS company → try legacy accounts/ path
-      console.info('[PetroBook] No SaaS company — trying legacy accounts/ path');
+      // New email user or email user whose setup failed silently
+      console.info('[PetroBook] v3: No company found for email='+email+' — trying legacy');
       return _pbRestoreLegacyPath(fbUser, claims, email, null, fsDb, btn);
     });
   }).catch(function(e){
-    console.error('[PetroBook] _pbHandleFirebaseUser failed:',e.code,e.message||e);
+    console.error('[PetroBook] v3 _pbHandleFirebaseUser failed:',e.code||'',e.message||e);
     if(btn){btn.disabled=false;btn.classList.remove('loading');}
-    showAuthErr('login-err','Account restore failed ('+e.code+'). Check your connection.');
+    showAuthErr('login-err','Account restore failed. Check your connection and try again.');
+  });
+}
+
+// ── Auth v3: Self-healing member document ─────────────────────────────────────
+// Writes companies/{cid}/members/{uid} if it doesn't exist.
+// MUST be called before _pbFinaliseRestore() because Firestore rules require
+// exists(members/{uid}) for all company data reads (isMemberOf check).
+// Uses isOwnerOf(cid) rule path (company doc ownerUid check) — does NOT require
+// the member doc to already exist.
+function _pbEnsureMemberDoc(uid, cid, role, email, displayName, fsDb){
+  if(!uid||!cid||!fsDb) return Promise.resolve();
+  var memberRef=fsDb.doc('companies/'+cid+'/members/'+uid);
+  return memberRef.get().then(function(doc){
+    if(!doc.exists){
+      console.info('[PetroBook] v3 self-heal: writing missing member doc. uid='+uid+' cid='+cid);
+      return memberRef.set({
+        uid:uid, role:role, status:'active',
+        email:email, displayName:displayName,
+        assignedPumps:[],
+        joinedAt:firebase.firestore.FieldValue.serverTimestamp()
+      });
+    }
+  }).catch(function(e){
+    // Log but don't block restore — Firestore rule fallback (isOwnerOf) will handle reads
+    console.warn('[PetroBook] v3 _pbEnsureMemberDoc failed (non-fatal):',e.code||'',e.message||e);
+  }).then(function(){
+    // Also write user doc so companies/{cid}/users is populated for manager UI
+    var userRef=fsDb.doc('companies/'+cid+'/users/'+uid);
+    return userRef.get().then(function(doc){
+      if(!doc.exists){
+        return userRef.set({
+          id:uid, uid:uid, email:email, name:displayName,
+          role:role, status:'active',
+          createdAt:firebase.firestore.FieldValue.serverTimestamp()
+        });
+      }
+    }).catch(function(e){
+      console.warn('[PetroBook] v3 _pbEnsureMemberDoc users write (non-fatal):',e.message||e);
+    });
   });
 }
 
@@ -29962,23 +30023,49 @@ function _pbShowGoogleOnboarding(fbUser){
   showAuthSetup(true); // true = skip resetting Google onboarding state
 }
 
-// ── Reset manager password ────────────────────────────────────────────────────
+// ── Reset manager password (Auth v3) ───────────────────────────────────
+// Auth v3: Owner via Firebase Auth current user (Google owners + active sessions)
+// or passHash fallback. Google-only owners (passHash===null) now supported.
 async function doResetManagerPass(){
   const ownerEmail=(document.getElementById('reset-owner-email').value||'').trim().toLowerCase();
   const ownerPass=(document.getElementById('reset-owner-pass').value||'');
   const mgrEmail=(document.getElementById('reset-mgr-email').value||'').trim().toLowerCase();
   const newPass=(document.getElementById('reset-new-pass').value||'');
-  if(!ownerEmail||!ownerPass||!mgrEmail||!newPass){showAuthErr('reset-err','Fill all fields.');return;}
+  if(!ownerEmail||!mgrEmail||!newPass){showAuthErr('reset-err','Fill all fields.');return;}
   if(newPass.length<6){showAuthErr('reset-err','New password must be 6+ characters.');return;}
-  const ownerHash=await _hashPass(ownerPass);
-  const requester=_getUserByEmail(ownerEmail);
-  if(!requester||requester.passHash!==ownerHash||(requester.role!=='owner'&&requester.role!=='super_owner')){
-    showAuthErr('reset-err','Owner credentials incorrect.');return;
+
+  // Auth path 1: Firebase Auth current user (Google owners + active sessions)
+  var firebaseAuthed=false;
+  if(typeof firebase!=='undefined'&&firebase.auth){
+    var cu=firebase.auth().currentUser;
+    if(cu&&cu.email&&cu.email.toLowerCase()===ownerEmail){
+      var sess=_getSession&&_getSession();
+      var sessRole=sess&&(sess.role||sess.userRole);
+      if(!sessRole){var ru=_getUserByEmail&&_getUserByEmail(ownerEmail);sessRole=ru&&ru.role;}
+      if(sessRole!=='owner'&&sessRole!=='super_owner'){
+        showAuthErr('reset-err','Only the owner can reset manager passwords.');return;
+      }
+      firebaseAuthed=true;
+    }
   }
-  const mgr=_getUserByEmail(mgrEmail);
+
+  // Auth path 2: passHash fallback (email/password owners without active Firebase session)
+  if(!firebaseAuthed){
+    if(!ownerPass){showAuthErr('reset-err','Enter your password to confirm.');return;}
+    const ownerHash=await _hashPass(ownerPass);
+    const requester=_getUserByEmail&&_getUserByEmail(ownerEmail);
+    if(!requester||requester.passHash!==ownerHash||
+       (requester.role!=='owner'&&requester.role!=='super_owner')){
+      showAuthErr('reset-err','Owner credentials incorrect.');return;
+    }
+  }
+
+  // Reset the manager password
+  const mgr=_getUserByEmail&&_getUserByEmail(mgrEmail);
   if(!mgr||mgr.role!=='manager'){showAuthErr('reset-err','Manager email not found.');return;}
-  mgr.passHash=await _hashPass(newPass);_saveUser(mgr);
-  try{showToast('Password reset for '+mgr.name+' \u2713');}catch(e){}
+  mgr.passHash=await _hashPass(newPass);
+  if(_saveUser) _saveUser(mgr);
+  try{showToast('Password reset for '+mgr.name+' ✓');}catch(e){}
   showAuthLogin();
 }
 
@@ -38977,8 +39064,14 @@ function _pbInitStorage(){
     if(_fpReady && typeof firebase !== 'undefined' && firebase.apps && firebase.apps.length){
       var _fbApp = firebase.app();
       if(typeof PB_FirebaseAuth !== 'undefined') PB_FirebaseAuth.init(_fbApp);
-      // If migration cutover already completed, restore SyncEngine.ACTIVE and
-      // re-activate the auth bridge so live sync resumes on every page load.
+      // Auth v3: Always register the onAuthStateChanged handler — not gated on
+      // pb-sync-active. This ensures cross-device restores work on fresh devices
+      // where pb-sync-active is not yet set. SyncEngine activation is deferred
+      // until _pbFinaliseRestore() (called by _pbHandleFirebaseUser or legacy path).
+      //
+      // ALSO: if pb-sync-active=1 is already set (same device, returning user),
+      // immediately activate SyncEngine + auth bridge so sync resumes without
+      // requiring a full login.
       if(localStorage.getItem('pb-sync-active') === '1'){
         try{
           // 1. Flip the SyncEngine flag so _intercept() starts queueing writes
@@ -38989,6 +39082,13 @@ function _pbInitStorage(){
           }
           // 3. Activate the auth bridge (requires SyncEngine.ACTIVE=true + PB_FirebaseAuth ready)
           if(typeof PB_AuthBridge !== 'undefined') PB_AuthBridge.activate();
+        }catch(e){ console.warn('[PetroBook] Sync resume failed:',e.message||e); }
+      }
+      // 4. ALWAYS register onAuthStateChanged — handles both returning users
+      //    (fast flush path) and fresh devices (full _pbHandleFirebaseUser restore).
+      if(true){ // was: if(localStorage.getItem('pb-sync-active')==='1')
+        try{
+          // (removed duplicate SyncEngine activation — now done above or in _pbFinaliseRestore)
           // 4. Init PB_FirestoreWriter once Firebase Auth resolves the user's accountId.
           //    accountId is read from the JWT custom claim (set by Admin SDK on first deployment).
           //    Falls back to fbUser.uid for the super_owner case.

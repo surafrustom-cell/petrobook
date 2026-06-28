@@ -100,61 +100,66 @@ service cloud.firestore {
     }
 
     // ── Company members sub-collection ───────────────────────────────────────
+    // v3: isOwnerOf(cid) added so owner can read/write member docs even before
+    //     their own member doc exists (bootstrap self-heal in _pbEnsureMemberDoc).
     match /companies/{cid}/members/{memberId} {
-      allow read:   if isMemberOf(cid);
+      allow read:   if isMemberOf(cid) || isOwnerOf(cid);
       allow write:  if isOwnerOf(cid) && noPassHash();
     }
 
     // ── Company users (mirrors accounts/ users structure) ────────────────────
+    // v3: isOwnerOf(cid) added to allow owner user-doc writes during self-heal.
     match /companies/{cid}/users/{userId} {
-      allow read:           if isMemberOf(cid);
-      allow create, update: if isMemberOf(cid) && isOwner() && noPassHash();
+      allow read:           if isMemberOf(cid) || isOwnerOf(cid);
+      allow create, update: if (isMemberOf(cid) || isOwnerOf(cid)) && isOwner() && noPassHash();
       allow delete:         if isOwnerOf(cid);
     }
 
     // ── Company global config ────────────────────────────────────────────────
+    // v3: isOwnerOf(cid) added — owner can load config even if member doc missing.
     match /companies/{cid}/global/{doc} {
-      allow read:  if isMemberOf(cid);
-      allow write: if isMemberOf(cid) && isOwner();
+      allow read:  if isMemberOf(cid) || isOwnerOf(cid);
+      allow write: if (isMemberOf(cid) || isOwnerOf(cid)) && isOwner();
     }
 
     // ── Company pumps ────────────────────────────────────────────────────────
+    // v3: isOwnerOf(cid) added as belt-and-suspenders for all pump reads.
     match /companies/{cid}/pumps/{pid} {
-      allow read:  if canAccessCompanyPump(cid, pid);
-      allow write: if canAccessCompanyPump(cid, pid) && isOwner();
+      allow read:  if canAccessCompanyPump(cid, pid) || isOwnerOf(cid);
+      allow write: if (canAccessCompanyPump(cid, pid) || isOwnerOf(cid)) && isOwner();
     }
 
     match /companies/{cid}/pumps/{pid}/data/config {
-      allow read:  if canAccessCompanyPump(cid, pid);
-      allow write: if canAccessCompanyPump(cid, pid) && isOwner();
+      allow read:  if canAccessCompanyPump(cid, pid) || isOwnerOf(cid);
+      allow write: if (canAccessCompanyPump(cid, pid) || isOwnerOf(cid)) && isOwner();
     }
 
     match /companies/{cid}/pumps/{pid}/data/snapshot {
-      allow read, write: if canAccessCompanyPump(cid, pid);
+      allow read, write: if canAccessCompanyPump(cid, pid) || isOwnerOf(cid);
     }
 
     match /companies/{cid}/pumps/{pid}/data/fuelHistory {
-      allow read:  if canAccessCompanyPump(cid, pid);
-      allow write: if canAccessCompanyPump(cid, pid) && isOwner();
+      allow read:  if canAccessCompanyPump(cid, pid) || isOwnerOf(cid);
+      allow write: if (canAccessCompanyPump(cid, pid) || isOwnerOf(cid)) && isOwner();
     }
 
     match /companies/{cid}/pumps/{pid}/history/{date} {
-      allow read:   if canAccessCompanyPump(cid, pid);
-      allow create: if canAccessCompanyPump(cid, pid);
-      allow update: if canAccessCompanyPump(cid, pid)
+      allow read:   if canAccessCompanyPump(cid, pid) || isOwnerOf(cid);
+      allow create: if canAccessCompanyPump(cid, pid) || isOwnerOf(cid);
+      allow update: if (canAccessCompanyPump(cid, pid) || isOwnerOf(cid))
                        && !(resource.data.get('locked', false) == true);
       allow delete: if false;
     }
 
     match /companies/{cid}/pumps/{pid}/ledger/{date} {
-      allow read:           if canAccessCompanyPump(cid, pid);
-      allow create, update: if canAccessCompanyPump(cid, pid);
+      allow read:           if canAccessCompanyPump(cid, pid) || isOwnerOf(cid);
+      allow create, update: if canAccessCompanyPump(cid, pid) || isOwnerOf(cid);
       allow delete:         if false;
     }
 
     match /companies/{cid}/pumps/{pid}/records/{date} {
-      allow read, write: if canAccessCompanyPump(cid, pid);
-      allow delete:      if canAccessCompanyPump(cid, pid) && isOwner();
+      allow read, write: if canAccessCompanyPump(cid, pid) || isOwnerOf(cid);
+      allow delete:      if (canAccessCompanyPump(cid, pid) || isOwnerOf(cid)) && isOwner();
     }
 
 
