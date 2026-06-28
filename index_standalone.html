@@ -4601,6 +4601,30 @@ body.owner-viewing #pg-history{padding-top:calc(46px + var(--safe-top));}
 }
 .pb-auth-btn-ghost:active{background:rgba(255,255,255,.10);transform:scale(.975);}
 
+/* ── Google Sign-In button ── */
+.pb-auth-google-btn{
+  width:100%;display:flex;align-items:center;justify-content:center;gap:11px;
+  padding:0 16px;height:50px;border-radius:14px;
+  background:#fff;border:none;
+  color:#1a1a2e;font-size:15px;font-weight:700;letter-spacing:-.1px;
+  box-shadow:0 2px 12px rgba(0,0,0,.22),0 1px 3px rgba(0,0,0,.12);
+  cursor:pointer;transition:transform .14s,box-shadow .14s,background .1s;
+  margin-bottom:4px;
+  -webkit-tap-highlight-color:transparent;touch-action:manipulation;
+}
+.pb-auth-google-btn:hover{background:#f8f8f8;box-shadow:0 4px 18px rgba(0,0,0,.28);}
+.pb-auth-google-btn:active{transform:scale(.975);box-shadow:0 1px 6px rgba(0,0,0,.18);}
+.pb-auth-google-btn:disabled,.pb-auth-google-btn.loading{opacity:.6;cursor:not-allowed;pointer-events:none;}
+.pb-auth-google-icon{width:20px;height:20px;flex-shrink:0;}
+/* ── "or" divider ── */
+.pb-auth-divider{
+  display:flex;align-items:center;gap:10px;
+  margin:10px 0 14px;color:rgba(255,255,255,.35);font-size:12.5px;
+}
+.pb-auth-divider::before,.pb-auth-divider::after{
+  content:'';flex:1;height:1px;background:rgba(255,255,255,.13);
+}
+
 /* ── Switch link ── */
 .pb-auth-switch{
   text-align:center;font-size:12.5px;color:rgba(255,255,255,.32);
@@ -10390,6 +10414,17 @@ tr:last-child td{border-bottom:none}
         <div class="pb-auth-sub" id="auth-login-sub">Sign in to manage your station.</div>
         <div class="pb-auth-err" id="login-err" role="alert"></div>
         <div class="pb-auth-lockout" id="login-lockout" role="alert"></div>
+        <!-- Google Sign-In -->
+        <button class="pb-auth-google-btn" id="google-login-btn" type="button" onclick="doGoogleLogin()">
+          <svg class="pb-auth-google-icon" viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg">
+            <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/>
+            <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>
+            <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/>
+            <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/>
+          </svg>
+          <span>Continue with Google</span>
+        </button>
+        <div class="pb-auth-divider"><span>or sign in with email</span></div>
         <div class="pb-auth-field">
           <label class="pb-auth-label" for="login-email" id="lbl-login-email">Email</label>
           <input class="pb-auth-input" id="login-email" type="email" placeholder="your@email.com" autocomplete="email" aria-required="true">
@@ -29451,8 +29486,23 @@ function showAuthScreen(id){
   document.querySelectorAll('.pb-auth-screen').forEach(s=>s.classList.remove('active'));
   const el=document.getElementById(id);if(el)el.classList.add('active');
 }
-function showAuthLogin(){ showAuthScreen('auth-login'); clearAuthErr(); }
-function showAuthSetup(){ showAuthScreen('auth-setup'); clearAuthErr(); }
+function showAuthLogin(){
+  // Reset Google onboarding state when returning to login
+  window._pbGoogleOnboarding=null;
+  showAuthScreen('auth-login'); clearAuthErr();
+}
+function showAuthSetup(fromGoogle){
+  // fromGoogle=true: called by _pbShowGoogleOnboarding — keep state as-is.
+  // Normal call: reset password field + Google state so it shows correctly.
+  if(!fromGoogle){
+    window._pbGoogleOnboarding=null;
+    var pe=document.getElementById('setup-pass');
+    if(pe){var fw=pe.closest('.pb-auth-field');if(fw)fw.style.display='';}
+    var ee=document.getElementById('setup-email');
+    if(ee){ee.readOnly=false;}
+  }
+  showAuthScreen('auth-setup'); clearAuthErr();
+}
 function showAuthReset(){ showAuthScreen('auth-reset'); clearAuthErr(); }
 function clearAuthErr(){
   ['setup-err','login-err','reset-err'].forEach(id=>{const el=document.getElementById(id);if(el){el.textContent='';el.classList.remove('show');}});
@@ -29598,12 +29648,13 @@ async function doSetup(){
   if(!station){showAuthErr('setup-err','Enter a station name.');return;}
   if(!name){showAuthErr('setup-err','Enter your name.');return;}
   if(!email||!email.includes('@')){showAuthErr('setup-err','Enter a valid email.');return;}
-  if(pass.length<6){showAuthErr('setup-err','Password must be at least 6 characters.');return;}
+  // Skip password requirement for Google-authenticated users
+  if(!window._pbGoogleOnboarding && pass.length<6){showAuthErr('setup-err','Password must be at least 6 characters.');return;}
   // Each device sets up its own local data.
   const btn=document.getElementById('setup-btn');if(btn){btn.disabled=true;btn.classList.add('loading');}
   const newUser={
     id:'su_'+Date.now(),name,email,
-    passHash:await _hashPass(pass),
+    passHash:window._pbGoogleOnboarding ? null : await _hashPass(pass),
     role:'super_owner',isSuperOwner:true,
     status:'active',stationName:station,
     createdAt:new Date().toISOString()
@@ -29622,17 +29673,22 @@ async function doSetup(){
     if(typeof firebase==='undefined'||!firebase.apps||!firebase.apps.length) return;
     var fsDb = firebase.firestore();
 
-    // Step A: Create or sign-in Firebase Auth user
-    var authPromise = firebase.auth().createUserWithEmailAndPassword(email, pass)
-      .then(function(cred){ return { uid:cred.user.uid, existed:false }; })
-      .catch(function(authErr){
-        if(authErr.code==='auth/email-already-in-use'){
-          // Firebase Auth user already exists (e.g. from CI setup script)
-          return firebase.auth().signInWithEmailAndPassword(email, pass)
-            .then(function(cred){ return { uid:cred.user.uid, existed:true }; });
-        }
-        throw authErr;
-      });
+    // Step A: Create or sign-in Firebase Auth user.
+    // For Google onboarding: user is already authenticated — use existing UID.
+    var _goob = window._pbGoogleOnboarding;
+    window._pbGoogleOnboarding = null; // consume flag
+    var authPromise = _goob
+      ? Promise.resolve({ uid: (firebase.auth().currentUser&&firebase.auth().currentUser.uid)||_goob.uid, existed:true })
+      : firebase.auth().createUserWithEmailAndPassword(email, pass)
+          .then(function(cred){ return { uid:cred.user.uid, existed:false }; })
+          .catch(function(authErr){
+            if(authErr.code==='auth/email-already-in-use'){
+              // Firebase Auth user already exists (e.g. from CI setup script)
+              return firebase.auth().signInWithEmailAndPassword(email, pass)
+                .then(function(cred){ return { uid:cred.user.uid, existed:true }; });
+            }
+            throw authErr;
+          });
 
     authPromise.then(function(res){
       var fbUid = res.uid;
@@ -29700,6 +29756,12 @@ async function doSetup(){
 }
 
 // ── Login ─────────────────────────────────────────────────────────────────────
+// ── Login ─────────────────────────────────────────────────────────────────────
+// Auth refactor v2: Firebase Auth is the ONLY identity source for owners.
+// Managers (local-only accounts) still use localStorage passHash (Path 1).
+// passHash is stored in localStorage for manager creation only — never used to
+// gate owner/super_owner login. Cross-device restoration works via Firebase UID
+// + userProfiles/{uid} without any localStorage dependency.
 async function doLogin(){
   const email=(document.getElementById('login-email').value||'').trim().toLowerCase();
   const pass=(document.getElementById('login-pass').value||'');
@@ -29714,133 +29776,44 @@ async function doLogin(){
   }
   const btn=document.getElementById('login-btn');
   if(btn){btn.disabled=true;btn.classList.add('loading');}
-  const passHash=await _hashPass(pass);
-  const user=_getUserByEmail(email);
 
-  // ── Path 1: Local user found and password matches ─────────────────────────────
-  if(user&&user.passHash===passHash){
+  // ── Path 1: Manager local login ───────────────────────────────────────────────
+  // Managers have no Firebase Auth account. Authentication is via localStorage
+  // passHash set by the owner when the manager account was created.
+  // Owners/super_owners always use Path 2 (Firebase Auth).
+  const user=_getUserByEmail(email);
+  if(user && user.role==='manager'){
+    const passHash=await _hashPass(pass);
+    if(user.passHash===passHash){
+      if(btn){btn.disabled=false;btn.classList.remove('loading');}
+      if(user.status==='inactive'){showAuthErr('login-err','Account is disabled. Contact the owner.');return;}
+      if(!user.pumpId){showAuthErr('login-err','No pump assigned. Contact the owner.');return;}
+      _doGrantAccess(user);
+      return;
+    }
     if(btn){btn.disabled=false;btn.classList.remove('loading');}
-    if(user.status==='inactive'){showAuthErr('login-err','Account is disabled. Contact the Super Owner.');return;}
-    if(user.role==='manager'&&!user.pumpId){showAuthErr('login-err','No pump assigned. Contact the owner.');return;}
-    _doGrantAccess(user);
-    // Phase 6: sign in to Firebase Auth non-blocking — never delays or blocks local login.
-    // If Firebase Auth has a stale/admin-set password, updatePassword() syncs it to the
-    // user's local password so cross-device restore works next time.
-    try{
-      if(typeof PB_AuthBridge!=='undefined'){
-        PB_AuthBridge.signInBridge(email,pass).catch(function(e){
-          if(e&&(e.code==='auth/wrong-password'||e.code==='auth/invalid-credential')){
-            var cu=typeof firebase!=='undefined'&&firebase.auth&&firebase.auth().currentUser;
-            if(cu){
-              cu.updatePassword(pass).then(function(){
-                console.info('[PetroBook] Firebase Auth password synced to local password.');
-              }).catch(function(upErr){
-                console.warn('[PetroBook] Could not sync Firebase Auth password:',upErr.code);
-              });
-            }
-          }
-        });
-      }
-    }catch(e){}
-    // BUG-M1: warn if login succeeded using a weak DJB2 hash (registered on HTTP)
-    if(user.passHash&&user.passHash.startsWith('fb')){
-      setTimeout(function(){try{showToast('⚠️ Password uses a weak hash. Please update it in Settings → Change Password.');}catch(e){}},2500);
+    const l=_recordFailedAttempt();
+    if(l.until){
+      const lkEl=document.getElementById('login-lockout');
+      if(lkEl){lkEl.textContent='Account locked for 5 minutes after too many failed attempts.';lkEl.classList.add('show');}
+      showAuthErr('login-err','');
+    } else {
+      const rem=MAX_ATTEMPTS-l.attempts;
+      showAuthErr('login-err','Incorrect email or password.'+(rem<3?' ('+rem+' attempts left)':''));
     }
     return;
   }
 
-  // ── Path 2: No local user — Firebase Auth restore for new/reset device ────────
-  // SaaS Phase 1 restore priority:
-  //   1. userProfiles/{uid}            → get companyId → restore from companies/{cid}/...
-  //   2. legacy accounts/{accountId}/  → restore data, run migration to companies/ in bg
-  //   3. Manager: userProfiles/{uid}.companyId → restore from companies/{cid}/...
-  //
-  // The inner .catch() for Firestore is SEPARATE from the outer Firebase Auth .catch()
-  // so Firestore errors produce a distinct message (not "Incorrect email or password").
-  if((!user||!user.passHash) && typeof firebase!=='undefined' && firebase.apps && firebase.apps.length){
-    console.info('[PetroBook] SETUP_TRIGGER_REASON=local_user_not_found — attempting Firebase restore for email:', email);
-    firebase.auth().signInWithEmailAndPassword(email, pass)
-      .then(function(cred){
-        var fbUser=cred.user;
-        console.info('[PetroBook] AUTH_UID='+fbUser.uid);
-        // Force-refresh so latest custom claims (accountId, role, pumpId) are present.
-        return fbUser.getIdTokenResult(true).then(function(tok){
-          var claims=tok.claims||{};
-          console.info('[PetroBook] TOKEN_CLAIMS='+JSON.stringify(claims));
-          var role=claims.role||'super_owner';
-          var pumpId=claims.pumpId||null;
-          var fsDb=firebase.firestore();
-
-          // ── SaaS Phase 1: resolve companyId via userProfiles first ─────────
-          return _pbResolveUserCompany(fbUser, fsDb).then(function(resolved){
-
-            // ── 2A: SaaS company found ─────────────────────────────────────
-            if(resolved && resolved.companyId){
-              var cid = resolved.companyId;
-              console.info('[PetroBook] SaaS restore. companyId='+cid+' source='+resolved.source);
-              // Cache + switch path prefix
-              _pbSetCompanyId(cid);
-              if(typeof PB_FIRESTORE_PATHS !== 'undefined') PB_FIRESTORE_PATHS.useCompanies();
-
-              return fsDb.collection('companies/'+cid+'/users').get()
-                .then(function(snap){
-                  var usersFound=snap.size;
-                  console.info('[PetroBook] SaaS USERS_FOUND='+usersFound);
-                  // No users in companies/ yet.
-                  // If we resolved this user via userProfile or companyQuery, restore
-                  // them directly from that data — avoids falling to the legacy path
-                  // where old Firestore rules may deny access due to missing claims.
-                  if(snap.empty){
-                    if(resolved && resolved.companyId && resolved.role){
-                      console.info('[PetroBook] SaaS: companies/users empty — restoring from userProfile. role='+resolved.role);
-                      var synthRole = resolved.role || claims.role || 'owner';
-                      var synthUser = {
-                        id: 'restored_'+Date.now(), email: email,
-                        role: synthRole, pumpId: claims.pumpId||null,
-                        status: 'active', name: email,
-                        passHash: passHash  // stamp so next local login works without Firebase Auth
-                      };
-                      _saveUsers([synthUser]);
-                      return _pbFinaliseRestore(synthUser, cid, synthRole, claims.pumpId||null, fbUser, fsDb, btn);
-                    }
-                    return _pbRestoreLegacyPath(fbUser, claims, email, cid, fsDb, btn);
-                  }
-                  var users=[];
-                  snap.forEach(function(doc){
-                    var u=Object.assign({},doc.data());
-                    delete u._syncedAt; delete u._v;
-                    users.push(u);
-                  });
-                  var me=users.find(function(u){return u.email&&u.email.toLowerCase()===email;});
-                  if(me){ me.passHash=passHash; } // stamp so next local login works without Firebase Auth
-                  _saveUsers(users);
-                  if(!me){
-                    // Possibly a manager whose profile exists but not in companies/users —
-                    // look up by role from userProfile
-                    var fakeMeRole = resolved.role||'manager';
-                    me = { id:'restored_'+Date.now(), email:email, role:fakeMeRole,
-                           pumpId:pumpId, status:'active', name:email, passHash:passHash };
-                  }
-                  return _pbFinaliseRestore(me, cid, role, pumpId, fbUser, fsDb, btn);
-                })
-                .catch(function(fsErr){
-                  console.error('[PetroBook] SaaS Firestore read failed:', fsErr.code, fsErr.message);
-                  // Fall through to legacy path
-                  return _pbRestoreLegacyPath(fbUser, claims, email, null, fsDb, btn);
-                });
-            }
-
-            // ── 2B: No SaaS company → try legacy accounts/ path ────────────
-            console.info('[PetroBook] No SaaS company found — trying legacy accounts/ path');
-            return _pbRestoreLegacyPath(fbUser, claims, email, null, fsDb, btn);
-          });
-        });
-      })
+  // ── Path 2: Firebase Auth — single source of truth for all non-manager accounts ─
+  // No passHash validation. Authentication is always Firebase → userProfiles → Firestore.
+  if(typeof firebase!=='undefined' && firebase.apps && firebase.apps.length){
+    console.info('[PetroBook] Firebase Auth path. email:',email);
+    firebase.auth().signInWithEmailAndPassword(email,pass)
+      .then(function(cred){ return _pbHandleFirebaseUser(cred.user, btn); })
       .catch(function(e){
-        // Firebase Auth failure — wrong email/password or network error.
         console.warn('[PetroBook] Firebase Auth failed:',e.code,e.message||e);
         if(btn){btn.disabled=false;btn.classList.remove('loading');}
-        var l=_recordFailedAttempt();
+        const l=_recordFailedAttempt();
         if(l.until){
           const lkEl=document.getElementById('login-lockout');
           if(lkEl){lkEl.textContent='Account locked for 5 minutes after too many failed attempts.';lkEl.classList.add('show');}
@@ -29850,20 +29823,143 @@ async function doLogin(){
           showAuthErr('login-err','Incorrect email or password.'+(rem<3?' ('+rem+' attempts left)':''));
         }
       });
-    return; // async path — exit sync function
+    return;
   }
 
-  // ── Path 3: Local user exists but password is wrong ───────────────────────────
+  // ── Path 3: Firebase unavailable ─────────────────────────────────────────────
   if(btn){btn.disabled=false;btn.classList.remove('loading');}
-  const l=_recordFailedAttempt();
-  if(l.until){
-    const lkEl=document.getElementById('login-lockout');
-    if(lkEl){lkEl.textContent='Account locked for 5 minutes after too many failed attempts.';lkEl.classList.add('show');}
-    showAuthErr('login-err','');
-  } else {
-    const rem=MAX_ATTEMPTS-l.attempts;
-    showAuthErr('login-err','Incorrect email or password.'+(rem<3?' ('+rem+' attempts left)':''));
+  showAuthErr('login-err','Authentication service unavailable. Check your connection and reload.');
+}
+
+// ── Google Sign-In ────────────────────────────────────────────────────────────
+// Primary auth method. One tap → Firebase UID → userProfiles → full restore.
+// No email/password needed. Works on any device instantly.
+async function doGoogleLogin(){
+  const btn=document.getElementById('google-login-btn');
+  if(btn){btn.disabled=true;btn.classList.add('loading');}
+  showAuthErr('login-err','');
+  if(typeof firebase==='undefined'||!firebase.apps||!firebase.apps.length){
+    if(btn){btn.disabled=false;btn.classList.remove('loading');}
+    showAuthErr('login-err','Google Sign-In requires an internet connection.');
+    return;
   }
+  try{
+    const provider=new firebase.auth.GoogleAuthProvider();
+    provider.addScope('email');
+    provider.addScope('profile');
+    const cred=await firebase.auth().signInWithPopup(provider);
+    await _pbHandleFirebaseUser(cred.user, btn);
+  }catch(e){
+    if(btn){btn.disabled=false;btn.classList.remove('loading');}
+    console.warn('[PetroBook] Google Sign-In failed:',e.code,e.message||e);
+    if(e.code==='auth/popup-closed-by-user'||e.code==='auth/cancelled-popup-request'){
+      // user dismissed — no error message
+    } else if(e.code==='auth/popup-blocked'){
+      showAuthErr('login-err','Pop-up was blocked. Allow pop-ups for this site and try again.');
+    } else if(e.code==='auth/account-exists-with-different-credential'){
+      showAuthErr('login-err','This email is registered with a different sign-in method. Use email/password below.');
+    } else {
+      showAuthErr('login-err','Google Sign-In failed. Try email and password below.');
+    }
+  }
+}
+
+// ── Shared Firebase restore — called after ANY successful Firebase sign-in ────
+// Works for email/password, Google SSO, and future providers.
+// Resolution order: userProfiles/{uid} → companies query → legacy accounts/.
+// No passHash dependency at any stage.
+function _pbHandleFirebaseUser(fbUser, btn){
+  var email=fbUser.email;
+  console.info('[PetroBook] AUTH_UID='+fbUser.uid+' email='+email);
+  // Force-refresh so latest custom claims are present
+  return fbUser.getIdTokenResult(true).then(function(tok){
+    var claims=tok.claims||{};
+    console.info('[PetroBook] TOKEN_CLAIMS='+JSON.stringify(claims));
+    var fsDb=firebase.firestore();
+
+    return _pbResolveUserCompany(fbUser, fsDb).then(function(resolved){
+
+      // ── SaaS path: companyId found via userProfiles or companyQuery ───────
+      if(resolved && resolved.companyId){
+        var cid=resolved.companyId;
+        console.info('[PetroBook] SaaS restore. companyId='+cid+' source='+resolved.source);
+        _pbSetCompanyId(cid);
+        if(typeof PB_FIRESTORE_PATHS!=='undefined') PB_FIRESTORE_PATHS.useCompanies();
+
+        return fsDb.collection('companies/'+cid+'/users').get()
+          .then(function(snap){
+            var role=resolved.role||claims.role||'owner';
+            var pumpId=claims.pumpId||null;
+
+            if(snap.empty){
+              // No users doc — restore from userProfile metadata
+              if(resolved.role){
+                console.info('[PetroBook] SaaS: companies/users empty — restoring from userProfile. role='+resolved.role);
+                var synthUser={
+                  id:'restored_'+Date.now(), email:email,
+                  role:resolved.role, pumpId:claims.pumpId||null,
+                  status:'active', name:fbUser.displayName||email
+                };
+                _saveUsers([synthUser]);
+                return _pbFinaliseRestore(synthUser, cid, resolved.role, claims.pumpId||null, fbUser, fsDb, btn);
+              }
+              return _pbRestoreLegacyPath(fbUser, claims, email, cid, fsDb, btn);
+            }
+
+            var users=[];
+            snap.forEach(function(doc){
+              var u=Object.assign({},doc.data()); delete u._syncedAt; delete u._v;
+              users.push(u);
+            });
+            var me=users.find(function(u){return u.email&&u.email.toLowerCase()===email;});
+            if(!me){
+              var fakeMeRole=resolved.role||'owner';
+              me={id:'restored_'+Date.now(),email:email,role:fakeMeRole,
+                  pumpId:pumpId,status:'active',name:fbUser.displayName||email};
+            }
+            _saveUsers(users);
+            return _pbFinaliseRestore(me, cid, role, pumpId, fbUser, fsDb, btn);
+          })
+          .catch(function(fsErr){
+            console.error('[PetroBook] SaaS Firestore read failed:',fsErr.code,fsErr.message);
+            return _pbRestoreLegacyPath(fbUser, claims, email, null, fsDb, btn);
+          });
+      }
+
+      // ── No SaaS company found ─────────────────────────────────────────────
+      // New Google users with no existing company → show company creation flow.
+      var isGoogle=fbUser.providerData&&
+        fbUser.providerData.some(function(p){return p.providerId==='google.com';});
+      if(isGoogle && resolved===null){
+        console.info('[PetroBook] New Google user — no company. Showing onboarding.');
+        if(btn){btn.disabled=false;btn.classList.remove('loading');}
+        _pbShowGoogleOnboarding(fbUser);
+        return;
+      }
+
+      // Email/password users with no SaaS company → try legacy accounts/ path
+      console.info('[PetroBook] No SaaS company — trying legacy accounts/ path');
+      return _pbRestoreLegacyPath(fbUser, claims, email, null, fsDb, btn);
+    });
+  }).catch(function(e){
+    console.error('[PetroBook] _pbHandleFirebaseUser failed:',e.code,e.message||e);
+    if(btn){btn.disabled=false;btn.classList.remove('loading');}
+    showAuthErr('login-err','Account restore failed ('+e.code+'). Check your connection.');
+  });
+}
+
+// ── Google onboarding — pre-fill company setup for new Google users ───────────
+// Called when a Google user has no existing company. Pre-fills name/email,
+// hides the password field (not needed for Google auth), then shows setup screen.
+function _pbShowGoogleOnboarding(fbUser){
+  window._pbGoogleOnboarding={uid:fbUser.uid, email:fbUser.email, displayName:fbUser.displayName||''};
+  var nameEl=document.getElementById('setup-name');
+  var emailEl=document.getElementById('setup-email');
+  var passEl=document.getElementById('setup-pass');
+  if(nameEl&&fbUser.displayName) nameEl.value=fbUser.displayName;
+  if(emailEl){emailEl.value=fbUser.email||''; emailEl.readOnly=true;}
+  if(passEl){var fw=passEl.closest('.pb-auth-field'); if(fw) fw.style.display='none';}
+  showAuthSetup(true); // true = skip resetting Google onboarding state
 }
 
 // ── Reset manager password ────────────────────────────────────────────────────
