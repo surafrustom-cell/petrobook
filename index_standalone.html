@@ -29304,20 +29304,27 @@ async function doLogin(){
       .then(function(cred){
         var fbUser=cred.user;
         console.info('[PetroBook] AUTH_UID='+fbUser.uid);
-        return fbUser.getIdTokenResult().then(function(tok){
+        // Force-refresh token so latest custom claims (accountId, role) are always present.
+        // Without forceRefresh=true, a stale cached token may have no accountId claim
+        // which causes Firestore rules to deny all reads (ownsAccount returns false).
+        return fbUser.getIdTokenResult(true).then(function(tok){
           var claims=tok.claims||{};
+          console.info('[PetroBook] TOKEN_CLAIMS='+JSON.stringify(claims));
           var accountId=claims.accountId||fbUser.uid;
           var role=claims.role||'super_owner';
           var pumpId=claims.pumpId||null;
           console.info('[PetroBook] ACCOUNT_ID='+accountId+' ROLE='+role+' PUMP_ID='+(pumpId||'none'));
           var fsDb=firebase.firestore();
-          // Load all users for this account from Firestore
+          // Load all users for this account from Firestore.
+          // This .catch() is SEPARATE from the outer Firebase Auth .catch() below so
+          // that Firestore permission-denied errors produce a distinct error message
+          // instead of "Incorrect email or password" (which was the prior bug).
           return fsDb.collection('accounts/'+accountId+'/users').get()
             .then(function(snap){
-              var found=!snap.empty;
-              console.info('[PetroBook] CONFIG_FOUND='+found+' user_count='+snap.size);
-              if(!found){
-                console.warn('[PetroBook] SETUP_TRIGGER_REASON=no_users_in_firestore — accountId:'+accountId);
+              var usersFound=snap.size;
+              console.info('[PetroBook] USERS_FOUND='+usersFound);
+              if(snap.empty){
+                console.error('[PetroBook] SETUP_TRIGGER_REASON=no_users_in_firestore', {uid:fbUser.uid, accountId:accountId, configExists:false, pumpsCount:0, usersCount:0});
                 if(btn){btn.disabled=false;btn.classList.remove('loading');}
                 showAuthErr('login-err','Cloud account data not found. Contact support.');
                 return;
@@ -29333,23 +29340,28 @@ async function doLogin(){
               // Find the logged-in user in the restored list
               var me=users.find(function(u){return u.email&&u.email.toLowerCase()===email;});
               if(!me){
-                console.warn('[PetroBook] SETUP_TRIGGER_REASON=email_not_in_firestore_users — email:'+email);
+                console.error('[PetroBook] SETUP_TRIGGER_REASON=email_not_in_firestore_users', {uid:fbUser.uid, accountId:accountId, email:email, usersCount:usersFound});
                 if(btn){btn.disabled=false;btn.classList.remove('loading');}
                 showAuthErr('login-err','Account email mismatch. Contact support.');
                 return;
               }
               // Load global config and pump list in parallel
+              var configExists=false;
+              var pumpsCount=0;
               var p1=fsDb.doc('accounts/'+accountId+'/global/config').get()
                 .then(function(d){
+                  configExists=d.exists;
+                  console.info('[PetroBook] CONFIG_DOC_EXISTS='+d.exists);
                   if(d.exists){
                     var g=Object.assign({},d.data());
                     delete g._syncedAt; delete g._v;
                     localStorage.setItem('pb-global-cfg-v1',JSON.stringify(g));
-                    console.info('[PetroBook] Restored global config from Firestore');
                   }
                 }).catch(function(e){ console.warn('[PetroBook] global/config read failed:',e.message||e); });
               var p2=fsDb.collection('accounts/'+accountId+'/pumps').get()
                 .then(function(ps){
+                  pumpsCount=ps.size;
+                  console.info('[PetroBook] PUMPS_FOUND='+pumpsCount);
                   if(!ps.empty){
                     var pumps=[];
                     ps.forEach(function(d){
@@ -29358,7 +29370,6 @@ async function doLogin(){
                       pumps.push(p);
                     });
                     localStorage.setItem('pb-pumps-v1',JSON.stringify(pumps));
-                    console.info('[PetroBook] Restored '+pumps.length+' pump(s) from Firestore');
                   }
                 }).catch(function(e){ console.warn('[PetroBook] pumps read failed:',e.message||e); });
               return Promise.all([p1,p2]).then(function(){
@@ -29368,13 +29379,26 @@ async function doLogin(){
                 console.info('[PetroBook] Firebase restore complete — granting access to',me.role,me.email);
                 _doGrantAccess(me);
               });
+            })
+            .catch(function(fsErr){
+              // Firestore read failed — SEPARATE from the Firebase Auth error below.
+              // Most likely: missing/stale accountId claim → Firestore rules denied.
+              // (firestore.rules v1.2 adds request.auth.uid fallback to mitigate this)
+              console.error('[PetroBook] SETUP_TRIGGER_REASON=firestore_read_failed', {uid:fbUser.uid, accountId:accountId, code:fsErr.code, message:fsErr.message||String(fsErr)});
+              if(btn){btn.disabled=false;btn.classList.remove('loading');}
+              if(fsErr.code==='permission-denied'){
+                showAuthErr('login-err','Your account exists but this device was denied access. Check that custom claims are set (accountId/role) and try again.');
+              } else {
+                showAuthErr('login-err','Could not restore your account ('+fsErr.code+'). Check your connection and try again.');
+              }
             });
         });
       })
       .catch(function(e){
-        console.warn('[PetroBook] Firebase restore failed:',e.code,e.message||e);
+        // Firebase Auth failure only — wrong email/password or network error.
+        // Firestore errors are caught above; this catch handles auth-layer failures.
+        console.warn('[PetroBook] Firebase Auth failed:',e.code,e.message||e);
         if(btn){btn.disabled=false;btn.classList.remove('loading');}
-        // Wrong Firebase password counts as a failed attempt
         var l=_recordFailedAttempt();
         if(l.until){
           const lkEl=document.getElementById('login-lockout');
@@ -38390,8 +38414,10 @@ function _pbInitStorage(){
             PB_FirebaseAuth.onAuthStateChanged(function(fbUser){
               if(!fbUser || PB_FirestoreWriter.isReady()) return;
               console.info('[PetroBook] AUTH_UID='+fbUser.uid);
-              fbUser.getIdTokenResult().then(function(tokenResult){
+              // Force-refresh so the latest custom claims are always reflected here
+              fbUser.getIdTokenResult(true).then(function(tokenResult){
                 var claims = tokenResult.claims||{};
+                console.info('[PetroBook] TOKEN_CLAIMS='+JSON.stringify(claims));
                 var aid = claims.accountId || fbUser.uid;
                 var role = claims.role||'(no claim)';
                 var pumpId = claims.pumpId||'(none)';

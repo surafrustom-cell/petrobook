@@ -1,6 +1,9 @@
 rules_version = '2';
 
 // PetroBook Firestore Security Rules
+// v1.2 — Fixed: ownsAccount() now also accepts request.auth.uid == aid
+//        so the super_owner can restore their account even when the
+//        custom accountId claim is missing from a stale/new JWT.
 // v1.1 — Fixed: /pumps/{pid}/data/* path mismatch (BUG-003)
 //        Code writes to /pumps/{pid}/data/config|snapshot|fuelHistory
 //        Rules now match the actual paths used by PB_FIRESTORE_PATHS.
@@ -16,7 +19,10 @@ service cloud.firestore {
     function isSuperOwner()    { return isAuth() && userRole() == 'super_owner'; }
     function isOwner()         { return isAuth() && (userRole() == 'owner' || userRole() == 'super_owner'); }
     function isManager()       { return isAuth() && (userRole() == 'manager' || isOwner()); }
-    function ownsAccount(aid)  { return isAuth() && accountId() == aid; }
+    // ownsAccount: primary check uses accountId custom claim; fallback uses
+    // request.auth.uid for the super_owner case where the claim may be absent
+    // (e.g. stale token on first new-device login before claims are propagated).
+    function ownsAccount(aid)  { return isAuth() && (request.auth.uid == aid || accountId() == aid); }
     function pumpClaim(pid)    { return request.auth.token.pumpId == pid; }
     function canAccessPump(aid, pid) {
       return ownsAccount(aid) && (isOwner() || pumpClaim(pid));
