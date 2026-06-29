@@ -13401,12 +13401,10 @@ var PB_SYNC_OP_MAP = (function () {
     },
 
     saveActivePump: {
-      path:      function(aid) { return PB_FIRESTORE_PATHS.activePump(aid); },
-      merge:     true,
-      transform: function(args) {
-        return { active: args[0], _syncedAt: new Date().toISOString() };
-      },
-      deviceOnly: false,
+      // activePump is DEVICE_LOCAL — each device tracks its own active pump independently.
+      // Aligned with PB_ConflictRules.RULES['activePump'] = 'DEVICE_LOCAL'.
+      // No Firestore write — localStorage only.
+      deviceOnly: true,
       syncGroup: 'session',
     },
 
@@ -13768,13 +13766,55 @@ var PB_QueueReplayEngine = (function () {
     try { localStorage.removeItem(DEAD_KEY); } catch (e) {}
   }
 
+  // ── One-time dead write-queue cleanup ──────────────────────────────────────
+  // Removes dead entries caused by known-transient failures that are now fixed:
+  //   1. path=null + data=null: pre-Phase-6 bug where aid was null at write time.
+  //   2. PERMISSION_DENIED: rules gaps now patched (global/config, global/lang).
+  // Calls QueueManager.markConfirmed() for each removed entry so the corresponding
+  // QueueManager op is cleared from pb-sync-queue-v1 and not replayed.
+  var WRITE_QUEUE_KEY = 'pb-firestore-write-queue-v1';
+  function cleanDeadWriteQueue() {
+    var removed = { nullPath: 0, permDenied: 0 };
+    try {
+      var raw = localStorage.getItem(WRITE_QUEUE_KEY);
+      if (!raw) return removed;
+      var queue = JSON.parse(raw);
+      if (!Array.isArray(queue)) return removed;
+      var cleaned = queue.filter(function(e) {
+        if (e.status !== 'dead') return true;                           // keep live entries untouched
+        if (e.path === null && e.data === null
+            && e.lastError && e.lastError.indexOf('path must be a non-empty string') !== -1) {
+          removed.nullPath++;
+          if (e.id && typeof QueueManager !== 'undefined') QueueManager.markConfirmed(e.id);
+          return false;
+        }
+        if (e.lastError && e.lastError.indexOf('Missing or insufficient permissions') !== -1) {
+          removed.permDenied++;
+          if (e.id && typeof QueueManager !== 'undefined') QueueManager.markConfirmed(e.id);
+          return false;
+        }
+        return true;
+      });
+      if (removed.nullPath + removed.permDenied > 0) {
+        localStorage.setItem(WRITE_QUEUE_KEY, JSON.stringify(cleaned));
+        console.log('[QUEUE RECOVERY] cleanDeadWriteQueue removed: nullPath=' + removed.nullPath
+          + ' permDenied=' + removed.permDenied
+          + ' remaining=' + cleaned.length);
+      }
+    } catch (e) {
+      console.warn('[QUEUE RECOVERY] cleanDeadWriteQueue error:', e);
+    }
+    return removed;
+  }
+
   return {
-    replayOne:        replayOne,
-    replayAll:        replayAll,
-    deadLetter:       deadLetter,
-    getDeadLetters:   getDeadLetters,
-    clearDeadLetters: clearDeadLetters,
-    MAX_RETRIES:      MAX_RETRIES,
+    replayOne:           replayOne,
+    replayAll:           replayAll,
+    deadLetter:          deadLetter,
+    getDeadLetters:      getDeadLetters,
+    clearDeadLetters:    clearDeadLetters,
+    cleanDeadWriteQueue: cleanDeadWriteQueue,
+    MAX_RETRIES:         MAX_RETRIES,
   };
 
 })();
@@ -29610,6 +29650,85 @@ async function _pbDataForensicsAsync(pumps, fsDb, base) {
   }
 }
 
+// ── Queue Recovery Console Tool ───────────────────────────────────────────────
+// Run from browser console: window.pbQueueRecovery()
+// Cleans dead write-queue entries, runs replayAll, logs [FIRESTORE WRITE TEST].
+// Safe to call multiple times — cleanup is idempotent (already-cleaned entries skipped).
+window.pbQueueRecovery = async function() {
+  console.group('[QUEUE RECOVERY] Manual recovery triggered');
+
+  // 1. Require writer to be ready
+  if (typeof PB_FirestoreWriter === 'undefined' || !PB_FirestoreWriter.isReady()) {
+    console.error('[QUEUE RECOVERY] PB_FirestoreWriter not ready — log in first');
+    console.groupEnd();
+    return { error: 'writer_not_ready' };
+  }
+  if (typeof PB_QueueReplayEngine === 'undefined' || typeof QueueManager === 'undefined') {
+    console.error('[QUEUE RECOVERY] QueueManager or PB_QueueReplayEngine unavailable');
+    console.groupEnd();
+    return { error: 'modules_unavailable' };
+  }
+
+  var pendingBefore = QueueManager.getPendingOperations().length;
+  console.log('[QUEUE RECOVERY] pending_before=' + pendingBefore);
+
+  // 2. Clean dead entries
+  var cleaned = PB_QueueReplayEngine.cleanDeadWriteQueue();
+  console.log('[QUEUE RECOVERY] cleaned nullPath=' + cleaned.nullPath + ' permDenied=' + cleaned.permDenied);
+
+  // 3. Run replayAll
+  var replayResult;
+  try {
+    replayResult = await PB_QueueReplayEngine.replayAll(PB_FirestoreWriter);
+  } catch(e) {
+    console.error('[QUEUE RECOVERY] replayAll error:', e);
+    replayResult = { replayed: 0, dead: 0, retried: 0, total: 0 };
+  }
+  var pendingAfter = QueueManager.getPendingOperations().length;
+  console.log('[QUEUE RECOVERY] pending_after=' + pendingAfter
+    + ' replayed=' + replayResult.replayed
+    + ' dead=' + replayResult.dead);
+  console.log('[RECOVERY RESULT] dead=' + replayResult.dead
+    + ' pending=' + pendingAfter
+    + ' confirmed=' + replayResult.replayed);
+
+  // 4. Firestore write tests — verify global/config and global/lang are now writable
+  var aid = PB_FirestoreWriter.getAccountId();
+  var fsDb;
+  try { fsDb = firebase.firestore(); } catch(e) { fsDb = null; }
+  if (fsDb && aid) {
+    var testResults = {};
+    var paths = {
+      config: (typeof PB_FIRESTORE_PATHS !== 'undefined') ? PB_FIRESTORE_PATHS.globalConfig(aid) : null,
+      lang:   (typeof PB_FIRESTORE_PATHS !== 'undefined') ? PB_FIRESTORE_PATHS.globalLang(aid)   : null,
+    };
+    for (var key in paths) {
+      var p = paths[key];
+      if (!p) { testResults[key] = 'no_path'; continue; }
+      try {
+        await fsDb.doc(p).set({ _recoveryTest: true, _syncedAt: new Date().toISOString() }, { merge: true });
+        testResults[key] = 'ok';
+      } catch(e) {
+        testResults[key] = 'FAIL: ' + (e && e.message ? e.message : String(e));
+      }
+      // Clean up test field
+      try { await fsDb.doc(p).update({ _recoveryTest: firebase.firestore.FieldValue.delete() }); } catch(e) {}
+    }
+    console.log('[FIRESTORE WRITE TEST] config=' + testResults.config + ' lang=' + testResults.lang);
+  } else {
+    console.warn('[FIRESTORE WRITE TEST] skipped — fsDb or aid unavailable');
+  }
+
+  console.groupEnd();
+  return {
+    cleaned: cleaned,
+    pendingBefore: pendingBefore,
+    pendingAfter: pendingAfter,
+    replayed: replayResult.replayed,
+    dead: replayResult.dead,
+  };
+};
+
 window.pbDataForensics = function(pumpIdArg) {
   var fsDb;
   try { fsDb = firebase.firestore(); } catch(e) {
@@ -40012,94 +40131,4 @@ function _pbInitStorage(){
               _pbHandleFirebaseUser(result.user, null);
             }
           }).catch(function(e){
-            console.warn('[AUTH] getRedirectResult failed:',e.code,e.message||e);
-            if(e.code==='auth/unauthorized-domain'){
-              console.error('[AUTH] UNAUTHORIZED DOMAIN — add to Firebase Console > Authentication > Settings > Authorized domains');
-            }
-          });
-        }
-      })();
-      // Auth v3: Always register the onAuthStateChanged handler — not gated on
-      // pb-sync-active. This ensures cross-device restores work on fresh devices
-      // where pb-sync-active is not yet set. SyncEngine activation is deferred
-      // until _pbFinaliseRestore() (called by _pbHandleFirebaseUser or legacy path).
-      //
-      // ALSO: if pb-sync-active=1 is already set (same device, returning user),
-      // immediately activate SyncEngine + auth bridge so sync resumes without
-      // requiring a full login.
-      if(localStorage.getItem('pb-sync-active') === '1'){
-        try{
-          // 1. Flip the SyncEngine flag so _intercept() starts queueing writes
-          if(typeof SyncEngine !== 'undefined') SyncEngine.ACTIVE = true;
-          // 2. Switch StorageService to use SyncEngine so all app writes are intercepted
-          if(typeof StorageService !== 'undefined' && typeof SyncEngine !== 'undefined'){
-            StorageService.setProvider(SyncEngine);
-          }
-          // 3. Activate the auth bridge (requires SyncEngine.ACTIVE=true + PB_FirebaseAuth ready)
-          if(typeof PB_AuthBridge !== 'undefined') PB_AuthBridge.activate();
-        }catch(e){ console.warn('[PetroBook] Sync resume failed:',e.message||e); }
-      }
-      // 4. ALWAYS register onAuthStateChanged — handles both returning users
-      //    (fast flush path) and fresh devices (full _pbHandleFirebaseUser restore).
-      if(true){ // was: if(localStorage.getItem('pb-sync-active')==='1')
-        try{
-          // (removed duplicate SyncEngine activation — now done above or in _pbFinaliseRestore)
-          // 4. Init PB_FirestoreWriter once Firebase Auth resolves the user's accountId.
-          //    accountId is read from the JWT custom claim (set by Admin SDK on first deployment).
-          //    Falls back to fbUser.uid for the super_owner case.
-          if(typeof PB_FirebaseAuth !== 'undefined' && typeof PB_FirestoreWriter !== 'undefined'){
-            PB_FirebaseAuth.onAuthStateChanged(function(fbUser){
-              if(!fbUser || PB_FirestoreWriter.isReady()) return;
-              console.info('[PetroBook] AUTH_UID='+fbUser.uid);
-              var fsDb = firebase.firestore();
-
-              // SaaS Phase 1: resolve writer root ID in priority order:
-              //   1. pb-company-id cache (set during setup/login on this device)
-              //   2. userProfiles/{uid} in Firestore (cross-device key)
-              //   3. JWT claims.accountId (legacy — still works for existing accounts)
-              //   4. fbUser.uid fallback (last resort)
-              var cachedCid = _pbGetCompanyId();
-              if(cachedCid){
-                // Fast path: company ID already known from this device's login/setup
-                if(typeof PB_FIRESTORE_PATHS !== 'undefined') PB_FIRESTORE_PATHS.useCompanies();
-                if(PB_FirestoreWriter.init(fsDb, cachedCid)){
-                  console.info('[SYNC] PB_FirestoreWriter initialised from cache. companyId:', cachedCid);
-                  PB_FirestoreWriter.flush().catch(function(){});
-                  if(typeof PB_QueueReplayEngine !== 'undefined'){
-                    PB_QueueReplayEngine.replayAll(PB_FirestoreWriter).catch(function(){});
-                  }
-                }
-                return;
-              }
-
-              // Slow path: look up via userProfiles or JWT claims
-              fbUser.getIdTokenResult(true).then(function(tokenResult){
-                var claims = tokenResult.claims||{};
-                console.info('[AUTH] TOKEN_CLAIMS='+JSON.stringify(claims));
-                var role = claims.role||'(no claim)';
-                var pumpId = claims.pumpId||'(none)';
-
-                // Try userProfiles/{uid} first
-                return fsDb.doc('userProfiles/'+fbUser.uid).get().then(function(profDoc){
-                  var rootId, useCompaniesPrefix;
-                  if(profDoc.exists && profDoc.data().companyId){
-                    rootId = profDoc.data().companyId;
-                    useCompaniesPrefix = true;
-                    _pbSetCompanyId(rootId); // cache for future fast-path
-                    console.info('[PetroBook] PB_FirestoreWriter rootId from userProfile:', rootId);
-                  } else {
-                    // Fall back to JWT claims (legacy accounts/ path)
-                    rootId = claims.accountId || fbUser.uid;
-                    useCompaniesPrefix = false;
-                    console.info('[PetroBook] PB_FirestoreWriter rootId from claims:', rootId);
-                  }
-                  if(typeof PB_FIRESTORE_PATHS !== 'undefined'){
-                    useCompaniesPrefix ? PB_FIRESTORE_PATHS.useCompanies() : PB_FIRESTORE_PATHS.useAccounts();
-                  }
-                  console.info('[PetroBook] ACCOUNT_ID='+rootId+' ROLE='+role+' PUMP_ID='+pumpId);
-                  if(PB_FirestoreWriter.init(fsDb, rootId)){
-                    console.info('[PetroBook] PB_FirestoreWriter initialised. rootId:', rootId);
-                    PB_FirestoreWriter.flush().catch(function(){});
-                    if(typeof PB_QueueReplayEngine !== 'undefined'){
-                      PB_QueueReplayEngine.replayAll(PB_FirestoreWriter).catch(function(){});
-     
+            console.warn('[AUTH] ge
