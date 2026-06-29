@@ -29070,6 +29070,13 @@ function _pbResolveUserCompany(fbUser, fsDb){
 // [V5: legacy migration removed — companies/ is the only auth path]
 
 function _pbFinaliseRestore(me, dataRootId, role, pumpId, fbUser, fsDb, btn){
+  // ── RESTORE LOCK ──────────────────────────────────────────────────────────────
+  // Block saveSession() and writeSnapshot() for the entire duration of Firestore
+  // hydration + initial dashboard render.  Lock is released after _doGrantAccess()
+  // returns so every synchronous call it triggers (switchToPump, renderOwnerDashboard,
+  // _pbLoadPumpData, refreshDashboard monkey-patches) is safely guarded.
+  window.PB_RESTORE_IN_PROGRESS = true;
+  console.info('[RESTORE] Firestore hydration started — role='+role+' pump='+(pumpId||'(owner)'));
   var prefix = (typeof PB_FIRESTORE_PATHS !== 'undefined') ? PB_FIRESTORE_PATHS.getPrefix() : 'companies'; // V5: companies/ is the only path
   var _base = prefix+'/'+dataRootId;
 
@@ -29224,42 +29231,42 @@ function _pbFinaliseRestore(me, dataRootId, role, pumpId, fbUser, fsDb, btn){
       // 2. Invalidate history cache so loadCarryForward reads fresh localStorage.
       //    (BUG-H1 cache was populated at page load with stale data.)
       try{ _histCache=null; _histCachePump=null; }catch(e){}
-      console.log('[OVERRIDE CHECK] _histCache invalidated');
+      console.log('[RESTORE] _histCache invalidated (BUG-H1 guard)');
 
       // 3. Clear all stale live state: readings, stockData, expItems, confirmed totals.
       if(typeof _clearLiveState==='function'){
         _clearLiveState();
-        console.log('[OVERRIDE CHECK] _clearLiveState() done — stale page-load memory wiped');
+        console.info('[RESTORE] Runtime memory cleared — readings/stockData/expItems wiped');
       }
 
       // 4. Reload global config (currency, PIN lock) from fresh pb-global-cfg-v1.
       if(typeof loadGCFG==='function'){
         loadGCFG();
-        console.log('[OVERRIDE CHECK] loadGCFG → [DATA SOURCE] Firestore');
+        console.info('[RESTORE] GCFG loaded — [DATA SOURCE] Firestore');
       }
 
       // 5. Reload pump config (prices, openings, categories) from fresh pump_settings_v1__pN.
       if(typeof loadCFG==='function'){
         loadCFG();
         if(typeof applyCFG==='function') applyCFG();
-        console.log('[OVERRIDE CHECK] loadCFG pid='+_restorePump+' → [DATA SOURCE] Firestore');
+        console.info('[RESTORE] CFG loaded pid='+_restorePump+' — [DATA SOURCE] Firestore');
       }
 
       // 6. Reload carry-forward (yesterday closings → today openings) from fresh pump_history_v1__pN.
       //    This sets readings[f][n].open and stockData[f].open for the active pump.
       if(typeof loadCarryForward==='function'){
         loadCarryForward();
-        console.log('[OVERRIDE CHECK] loadCarryForward pid='+_restorePump+' → [DATA SOURCE] Firestore');
+        console.info('[RESTORE] Carry-forward loaded pid='+_restorePump+' — [DATA SOURCE] Firestore');
       }
 
       // 7. Reload today's in-progress session from fresh pb-session-v1__pN.
       //    This sets expItems, cardItems, readings[f][n] close values, shiftIdx, etc.
-      //    After this, saveSession() in switchToPump will write CORRECT data (not stale).
+      //    saveSession() is guarded by PB_RESTORE_IN_PROGRESS so this data is safe.
       if(typeof loadSession==='function'){
         var _sessionOk=loadSession();
-        console.log('[OVERRIDE CHECK] loadSession pid='+_restorePump+' found='+_sessionOk+' → [DATA SOURCE] Firestore');
+        console.info('[RESTORE] Session loaded pid='+_restorePump+' found='+_sessionOk+' — [DATA SOURCE] Firestore');
         if(!_sessionOk){
-          console.log('[DATA SOURCE] No in-progress session for today — clean slate (correct for new day or new device)');
+          console.log('[RESTORE] No in-progress session for today — clean slate (correct for new day or new device)');
         }
       }
     }catch(reloadErr){
@@ -29280,8 +29287,17 @@ function _pbFinaliseRestore(me, dataRootId, role, pumpId, fbUser, fsDb, btn){
       }
     }catch(e){}
     if(btn){btn.disabled=false;btn.classList.remove('loading');}
-    console.info('[RESTORE] Complete — granting access. role='+me.role+' email='+me.email);
+    console.info('[RESTORE] Granting access — role='+me.role+' email='+me.email);
+    // PB_RESTORE_IN_PROGRESS is still true here so every synchronous call inside
+    // _doGrantAccess (switchToPump → saveSession/writeSnapshot, renderOwnerDashboard →
+    // _pbLoadPumpData) is guarded and cannot overwrite the Firestore-restored state.
     _doGrantAccess(me);
+    // ── RELEASE RESTORE LOCK ─────────────────────────────────────────────────
+    // All synchronous rendering triggered by _doGrantAccess is now complete.
+    // From this point saveSession/writeSnapshot/refreshDashboard operate normally
+    // using the freshly reloaded in-memory state (which matches Firestore).
+    window.PB_RESTORE_IN_PROGRESS = false;
+    console.info('[RESTORE] Restore complete — lock released. [DATA SOURCE] now RuntimeMemory');
   });
 }
 
@@ -33475,6 +33491,12 @@ function _sessionHasLiveData(){
 }
 
 function saveSession(){
+  // RESTORE LOCK: during Firestore hydration, in-memory globals are stale/zero.
+  // Writing them would overwrite the fresh Firestore data just saved to localStorage.
+  if(window.PB_RESTORE_IN_PROGRESS){
+    console.log('[RESTORE] saveSession() blocked — restore in progress');
+    return true;
+  }
   // BUG-C4: clear error flag before write so we get a clean signal
   window._pbSaveError = null;
   try{
@@ -37242,6 +37264,13 @@ function _liveTotals(){
 // ── Per-pump snapshot (the owner dashboard's real-time data source) ──
 function _snapKey(id){ return id==='p1' ? PB_SNAP_BASE : PB_SNAP_BASE+'__'+id; }
 function writeSnapshot(){
+  // RESTORE LOCK: _liveTotals() reflects stale/zero in-memory state during hydration.
+  // Writing it would overwrite the Firestore-restored pb-snap-v1__pN.
+  // Also guards both refreshDashboard monkey-patches which call writeSnapshot().
+  if(window.PB_RESTORE_IN_PROGRESS){
+    console.log('[RESTORE] writeSnapshot() blocked — restore in progress');
+    return;
+  }
   try{
     const t=_liveTotals();
     StorageService.saveStock({
@@ -37269,11 +37298,18 @@ function readSnapshot(id){
 function _pbLoadPumpData(pumps){
   return pumps.map(function(p){
     var snap;
-    if(p.id===ACTIVE_PUMP){
+    if(p.id===ACTIVE_PUMP && !window.PB_RESTORE_IN_PROGRESS){
+      // Normal mode: compute live totals from fresh in-memory state for active pump
       const t=_liveTotals();
       snap={grand:Math.round(t.grand),cash:Math.round(t.cash),bank:Math.round(t.bank),sale:Math.round(t.sale),stockVal:Math.round(t.stockVal)};
+      console.log('[DATA SOURCE] RuntimeMemory — '+p.id+' (live totals)');
     } else {
+      // During restore: use Firestore-restored snapshot for ALL pumps (avoids stale _liveTotals).
+      // Also used for non-active pumps in normal mode (unchanged behaviour).
       snap=readSnapshot(p.id);
+      if(window.PB_RESTORE_IN_PROGRESS){
+        console.log('[DATA SOURCE] LocalStorage — '+p.id+' (Firestore-restored snapshot, restore in progress)');
+      }
     }
     return {pump:p, snap:snap};
   });
