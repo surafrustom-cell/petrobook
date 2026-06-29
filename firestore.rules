@@ -52,7 +52,11 @@ service cloud.firestore {
         // Fast path: companyId in JWT claim (set via Admin SDK — Phase 2+)
         companyId() == cid ||
         // Structural check: member document exists for this user
-        exists(/databases/$(database)/documents/companies/$(cid)/members/$(uid()))
+        exists(/databases/$(database)/documents/companies/$(cid)/members/$(uid())) ||
+        // Fallback: userProfiles/{uid} claims this companyId (cross-device manager restore).
+        // Covers managers whose member doc was never written (pre-migration or offline creation).
+        // Safe: get() returns default data when doc is missing, so .get('companyId','') == '' != cid.
+        get(/databases/$(database)/documents/userProfiles/$(uid())).data.get('companyId', '') == cid
       );
     }
     function isOwnerOf(cid) {
@@ -102,9 +106,14 @@ service cloud.firestore {
     // ── Company members sub-collection ───────────────────────────────────────
     // v3: isOwnerOf(cid) added so owner can read/write member docs even before
     //     their own member doc exists (bootstrap self-heal in _pbEnsureMemberDoc).
+    // v4: user can self-heal their OWN member doc if their userProfile claims this
+    //     company — fixes cross-device manager restore when member doc is missing.
     match /companies/{cid}/members/{memberId} {
       allow read:   if isMemberOf(cid) || isOwnerOf(cid);
-      allow write:  if isOwnerOf(cid) && noPassHash();
+      allow write:  if (isOwnerOf(cid) && noPassHash()) ||
+                       // Self-heal: manager writes their own member doc on first cross-device login
+                       (isAuth() && uid() == memberId && noPassHash() &&
+                        get(/databases/$(database)/documents/userProfiles/$(uid())).data.get('companyId', '') == cid);
     }
 
     // ── Company users (mirrors accounts/ users structure) ────────────────────
@@ -124,27 +133,32 @@ service cloud.firestore {
 
     // ── Company pumps ────────────────────────────────────────────────────────
     // v3: isOwnerOf(cid) added as belt-and-suspenders for all pump reads.
+    // v4: isMemberOf(cid) added to reads so managers can load pump list on
+    //     cross-device restore (_pbFinaliseRestore collection read). Writes
+    //     remain restricted to canAccessCompanyPump (assigned pump via pumpClaim
+    //     or owner role) to prevent managers writing to unassigned pumps.
     match /companies/{cid}/pumps/{pid} {
-      allow read:  if canAccessCompanyPump(cid, pid) || isOwnerOf(cid);
+      allow read:  if canAccessCompanyPump(cid, pid) || isOwnerOf(cid) || isMemberOf(cid);
       allow write: if (canAccessCompanyPump(cid, pid) || isOwnerOf(cid)) && isOwner();
     }
 
     match /companies/{cid}/pumps/{pid}/data/config {
-      allow read:  if canAccessCompanyPump(cid, pid) || isOwnerOf(cid);
+      allow read:  if canAccessCompanyPump(cid, pid) || isOwnerOf(cid) || isMemberOf(cid);
       allow write: if (canAccessCompanyPump(cid, pid) || isOwnerOf(cid)) && isOwner();
     }
 
     match /companies/{cid}/pumps/{pid}/data/snapshot {
-      allow read, write: if canAccessCompanyPump(cid, pid) || isOwnerOf(cid);
+      allow read:  if canAccessCompanyPump(cid, pid) || isOwnerOf(cid) || isMemberOf(cid);
+      allow write: if canAccessCompanyPump(cid, pid) || isOwnerOf(cid);
     }
 
     match /companies/{cid}/pumps/{pid}/data/fuelHistory {
-      allow read:  if canAccessCompanyPump(cid, pid) || isOwnerOf(cid);
+      allow read:  if canAccessCompanyPump(cid, pid) || isOwnerOf(cid) || isMemberOf(cid);
       allow write: if (canAccessCompanyPump(cid, pid) || isOwnerOf(cid)) && isOwner();
     }
 
     match /companies/{cid}/pumps/{pid}/history/{date} {
-      allow read:   if canAccessCompanyPump(cid, pid) || isOwnerOf(cid);
+      allow read:   if canAccessCompanyPump(cid, pid) || isOwnerOf(cid) || isMemberOf(cid);
       allow create: if canAccessCompanyPump(cid, pid) || isOwnerOf(cid);
       allow update: if (canAccessCompanyPump(cid, pid) || isOwnerOf(cid))
                        && !(resource.data.get('locked', false) == true);
@@ -152,14 +166,15 @@ service cloud.firestore {
     }
 
     match /companies/{cid}/pumps/{pid}/ledger/{date} {
-      allow read:           if canAccessCompanyPump(cid, pid) || isOwnerOf(cid);
+      allow read:           if canAccessCompanyPump(cid, pid) || isOwnerOf(cid) || isMemberOf(cid);
       allow create, update: if canAccessCompanyPump(cid, pid) || isOwnerOf(cid);
       allow delete:         if false;
     }
 
     match /companies/{cid}/pumps/{pid}/records/{date} {
-      allow read, write: if canAccessCompanyPump(cid, pid) || isOwnerOf(cid);
-      allow delete:      if (canAccessCompanyPump(cid, pid) || isOwnerOf(cid)) && isOwner();
+      allow read:   if canAccessCompanyPump(cid, pid) || isOwnerOf(cid) || isMemberOf(cid);
+      allow write:  if canAccessCompanyPump(cid, pid) || isOwnerOf(cid);
+      allow delete: if (canAccessCompanyPump(cid, pid) || isOwnerOf(cid)) && isOwner();
     }
 
 

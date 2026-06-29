@@ -30116,6 +30116,7 @@ function _pbHandleFirebaseUser(fbUser, btn){
   var displayName=fbUser.displayName||email;
 
   console.info('[AUTH] _pbHandleFirebaseUser START');
+  console.log('[AUTH]', uid);   // diagnostic
   console.info('[AUTH] uid='+uid+' email='+email);
 
   var fsDb=firebase.firestore();
@@ -30128,49 +30129,99 @@ function _pbHandleFirebaseUser(fbUser, btn){
     console.info('[RESTORE] STEP 1 — reading userProfiles/'+uid);
     return _pbResolveUserCompany(fbUser, fsDb).then(function(resolved){
 
+      var profileDocExists = !!(resolved && resolved.companyId);
+      console.log('[PROFILE]', profileDocExists);   // diagnostic
+
       // ── CASE A: companyId found ───────────────────────────────────────────
       if(resolved && resolved.companyId){
         var cid=resolved.companyId;
         var role=resolved.role||claims.role||'owner';
+        // Honour assignedPumps from profile; fall back to JWT pumpId claim
+        var pumpId=claims.pumpId||(resolved.assignedPumps&&resolved.assignedPumps[0])||null;
 
+        console.log('[COMPANY]', cid);   // diagnostic
         console.info('[RESTORE] STEP 2 — companyId='+cid+' role='+role+' source='+resolved.source);
 
-        // ── STEP 3: Verify company document exists ────────────────────────────
-        console.info('[COMPANY] STEP 3 — reading companies/'+cid);
-        return fsDb.doc('companies/'+cid).get().then(function(coDoc){
-          if(!coDoc.exists){
-            console.error('[COMPANY] STEP 3 FAIL — companies/'+cid+' does not exist');
+        // ── STEP 3.5: Self-heal member doc BEFORE reading companies/{cid} ──────
+        // Firestore rule v4 allows users to write their own member doc when
+        // userProfiles/{uid} claims this cid — no owner login needed.
+        // This ensures isMemberOf(cid) is true via exists() for STEP 3.
+        console.info('[RESTORE] STEP 3.5 — pre-healing member doc uid='+uid+' cid='+cid);
+        return _pbEnsureMemberDoc(uid, cid, role, email, displayName, fsDb).then(function(){
+
+          // ── STEP 3: Verify company document exists ──────────────────────────
+          console.info('[COMPANY] STEP 3 — reading companies/'+cid);
+          return fsDb.doc('companies/'+cid).get().then(function(coDoc){
+            if(!coDoc.exists){
+              console.error('[COMPANY] STEP 3 FAIL — companies/'+cid+' does not exist');
+              console.log('[FIRESTORE_ERROR]', 'companies/'+cid+' missing');
+              if(btn){btn.disabled=false;btn.classList.remove('loading');}
+              showAuthErr('login-err',
+                'Your company record was not found in Firestore. Diagnostic: companies/'+cid+' missing. Please contact support or create a new company.');
+              return;
+            }
+            console.info('[COMPANY] STEP 3 OK — company exists. name='+(coDoc.data().name||'?'));
+
+            // ── STEP 4: Confirm member doc status ────────────────────────────
+            var memberPath='companies/'+cid+'/members/'+uid;
+            return fsDb.doc(memberPath).get().then(function(memDoc){
+              console.log('[MEMBER]', memDoc.exists);   // diagnostic
+              if(!memDoc.exists){
+                console.warn('[RESTORE] STEP 4 — member doc still missing after self-heal. path='+memberPath);
+              } else {
+                console.info('[RESTORE] STEP 4 OK — member doc confirmed.');
+              }
+
+              // Set company context
+              _pbSetCompanyId(cid);
+              if(typeof PB_FIRESTORE_PATHS!=='undefined') PB_FIRESTORE_PATHS.useCompanies();
+
+              // Build user object from Firebase Auth + profile data
+              var restoredUser={
+                id:uid, uid:uid,
+                email:email, name:displayName,
+                role:role, pumpId:pumpId,
+                assignedPumps:resolved.assignedPumps||[],
+                status:'active', firebaseUid:uid
+              };
+              _saveUsers([restoredUser]);
+
+              console.info('[RESTORE] All steps passed. Starting finalise restore…');
+              return _pbFinaliseRestore(restoredUser, cid, role, pumpId, fbUser, fsDb, btn);
+            }).catch(function(memberErr){
+              // Member doc read failed — non-fatal: continue with restore
+              console.warn('[RESTORE] STEP 4 member read (non-fatal):',memberErr.code||'',memberErr.message||memberErr);
+              console.log('[MEMBER]', false);
+              console.log('[FIRESTORE_ERROR]', 'members read: '+(memberErr.code||memberErr.message||String(memberErr)));
+              _pbSetCompanyId(cid);
+              if(typeof PB_FIRESTORE_PATHS!=='undefined') PB_FIRESTORE_PATHS.useCompanies();
+              var restoredUser={
+                id:uid, uid:uid,
+                email:email, name:displayName,
+                role:role, pumpId:pumpId,
+                assignedPumps:resolved.assignedPumps||[],
+                status:'active', firebaseUid:uid
+              };
+              _saveUsers([restoredUser]);
+              return _pbFinaliseRestore(restoredUser, cid, role, pumpId, fbUser, fsDb, btn);
+            });
+          }).catch(function(coErr){
+            // STEP 3 company read failed
+            console.error('[COMPANY] STEP 3 FAILED:',coErr.code||'',coErr.message||coErr);
+            console.log('[FIRESTORE_ERROR]', 'companies/'+cid+': '+(coErr.code||coErr.message||String(coErr)));
             if(btn){btn.disabled=false;btn.classList.remove('loading');}
-            showAuthErr('login-err',
-              'Your company record was not found in Firestore. Diagnostic: companies/'+cid+' missing. Please contact support or create a new company.');
-            return;
-          }
-          console.info('[COMPANY] STEP 3 OK — company exists. name='+( coDoc.data().name||'?'));
-
-          // ── STEP 4: Ensure member document exists (self-heal) ────────────────
-          console.info('[RESTORE] STEP 4 — ensuring members/'+uid);
-          return _pbEnsureMemberDoc(uid, cid, role, email, displayName, fsDb).then(function(){
-
-            // Set company context
-            _pbSetCompanyId(cid);
-            if(typeof PB_FIRESTORE_PATHS!=='undefined') PB_FIRESTORE_PATHS.useCompanies();
-
-            // Build owner user object from Firebase Auth — no Firestore users read
-            var ownerUser={
-              id:uid, uid:uid,
-              email:email, name:displayName,
-              role:role, pumpId:claims.pumpId||null,
-              status:'active', firebaseUid:uid
-            };
-            _saveUsers([ownerUser]);
-
-            console.info('[RESTORE] All 4 steps passed. Starting finalise restore…');
-            return _pbFinaliseRestore(ownerUser, cid, role, claims.pumpId||null, fbUser, fsDb, btn);
+            if(coErr.code==='permission-denied'){
+              showAuthErr('login-err',
+                'Permission denied reading company data. Path: companies/'+cid+
+                '. Ensure your account has a member document. Contact the owner to re-add you, or ask them to log in first to initialise Firestore.');
+            } else {
+              showAuthErr('login-err','Company data unavailable. Check your connection and try again.');
+            }
           });
         });
       }
 
-      // ── CASE B: No company found anywhere ────────────────────────────────
+      // ── CASE B: No company found anywhere ──────────────────────────────────
       // V5: No legacy fallback. Check if this is a new Google user (needs onboarding)
       // or an email user whose setup was never completed.
       var isGoogle=fbUser.providerData&&
@@ -30185,12 +30236,15 @@ function _pbHandleFirebaseUser(fbUser, btn){
 
       // Email user with no company — setup was never completed or failed
       console.error('[AUTH] No company found for uid='+uid+' email='+email);
+      console.log('[PROFILE]', false);
+      console.log('[FIRESTORE_ERROR]', 'userProfiles/'+uid+' missing or no companyId');
       if(btn){btn.disabled=false;btn.classList.remove('loading');}
       showAuthErr('login-err',
         'No company found for this account. Diagnostic: userProfiles/'+uid+' missing or has no companyId. Please complete company setup or contact support.');
     });
   }).catch(function(e){
     console.error('[AUTH] _pbHandleFirebaseUser FAILED:',e.code||'',e.message||e);
+    console.log('[FIRESTORE_ERROR]', e.code||e.message||String(e));
     if(btn){btn.disabled=false;btn.classList.remove('loading');}
     if(e.code==='permission-denied'){
       showAuthErr('login-err','Permission denied reading your account. Check Firestore rules and try again.');
