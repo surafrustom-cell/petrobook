@@ -12740,31 +12740,101 @@ var SyncEngine = (function () {
     }
 
     // Future: attempt cloud write
-    _cloudWrite(op);
+    _cloudWrite(op, args);
 
     return result;
   }
 
-  // Cloud write — routes through PB_FirestoreWriter when sync is active
-  function _cloudWrite(op) {
+  // Cloud write — routes through PB_FirestoreWriter when sync is active.
+  // args: the original StorageService call arguments (live at intercept time).
+  function _cloudWrite(op, args) {
     if (!op || !op.id) return;
-    // Route through PB_FirestoreWriter when the writer is initialised and active
-    if (typeof PB_FirestoreWriter !== 'undefined' && PB_FirestoreWriter.isReady()) {
-      var result = PB_FirestoreWriter.enqueue(op);
-      if (result && result.status === 'queued') {
-        // Attempt immediate flush; failures stay in persistent queue for replay
-        PB_FirestoreWriter.flush().then(function(r) {
-          if (r && r.status === 'ok') SyncStatusManager.setStatus('synced');
-        }).catch(function(e) {
-          console.warn('[SyncEngine] _cloudWrite flush error:', e);
-          SyncStatusManager.setStatus('error', e && e.message ? e.message : String(e));
-        });
-      } else if (result && result.status === 'skipped') {
-        // Writer not yet active — mark confirmed locally so QueueManager stays clean
-        QueueManager.markConfirmed(op.id);
-      }
-    } else {
+
+    if (typeof PB_FirestoreWriter === 'undefined' || !PB_FirestoreWriter.isReady()) {
       // Writer not available — mark confirmed locally (offline-first, no data loss)
+      QueueManager.markConfirmed(op.id);
+      return;
+    }
+
+    // Skip device-only ops — data lives in localStorage only, never Firestore
+    if (typeof PB_SYNC_OP_MAP !== 'undefined' && PB_SYNC_OP_MAP.isDeviceOnly(op.type)) {
+      QueueManager.markConfirmed(op.id);
+      return;
+    }
+
+    // Build Firestore path + data from live args via PB_SYNC_OP_MAP
+    // (same pattern as PB_QueueReplayEngine.replayOne — args are available here
+    //  because _cloudWrite is called synchronously inside _intercept while args is in scope)
+    if (typeof PB_SYNC_OP_MAP !== 'undefined' && args) {
+      var mapEntry = PB_SYNC_OP_MAP.get(op.type);
+      if (mapEntry) {
+        var aid = PB_FirestoreWriter.getAccountId();
+        var pid = op.pumpId || null;
+        var path = mapEntry.path ? mapEntry.path(aid, pid, args) : null;
+        var data = mapEntry.transform ? mapEntry.transform(args) : args[0];
+
+        // Fan-out ops (saveUser, savePump, saveReport) return an array from transform
+        if (Array.isArray(data)) {
+          var items = data.map(function(d) {
+            var itemPath = d.docPath ||
+              (d._histDate ? PB_FIRESTORE_PATHS.history(d._aid || aid, pid, d._histDate) : null) ||
+              path;
+            return { path: itemPath, data: d.data || d, options: { merge: false } };
+          }).filter(function(d) { return d.path; });
+          if (items.length) {
+            PB_FirestoreWriter.batchWrite(items)
+              .then(function() {
+                QueueManager.markConfirmed(op.id);
+                SyncStatusManager.setStatus('synced');
+              })
+              .catch(function(e) {
+                console.warn('[SyncEngine] _cloudWrite batchWrite error:', e);
+                SyncStatusManager.setStatus('error', e && e.message ? e.message : String(e));
+              });
+          } else {
+            // Empty batch (e.g. no users or no report dates) — nothing to write
+            QueueManager.markConfirmed(op.id);
+          }
+          return;
+        }
+
+        // Standard single-document write — build a proper cloudOp for PB_FirestoreWriter
+        var cloudOp = {
+          id:        op.id,
+          type:      op.type,
+          path:      path,
+          data:      data,
+          options:   { merge: !!mapEntry.merge, isDelete: !!mapEntry.isDelete },
+          pumpId:    pid,
+          timestamp: op.timestamp,
+        };
+
+        var result = PB_FirestoreWriter.enqueue(cloudOp);
+        if (result && result.status === 'queued') {
+          PB_FirestoreWriter.flush().then(function(r) {
+            if (r && r.status === 'ok') SyncStatusManager.setStatus('synced');
+          }).catch(function(e) {
+            console.warn('[SyncEngine] _cloudWrite flush error:', e);
+            SyncStatusManager.setStatus('error', e && e.message ? e.message : String(e));
+          });
+        } else if (result && (result.status === 'skipped' || result.status === 'rejected')) {
+          QueueManager.markConfirmed(op.id);
+        }
+        // throttled: leave QueueManager pending — replayQueue will retry
+        return;
+      }
+    }
+
+    // Fallback: PB_SYNC_OP_MAP unavailable or no mapEntry — pass raw op as before
+    var result = PB_FirestoreWriter.enqueue(op);
+    if (result && result.status === 'queued') {
+      PB_FirestoreWriter.flush().then(function(r) {
+        if (r && r.status === 'ok') SyncStatusManager.setStatus('synced');
+      }).catch(function(e) {
+        console.warn('[SyncEngine] _cloudWrite flush error:', e);
+        SyncStatusManager.setStatus('error', e && e.message ? e.message : String(e));
+      });
+    } else if (result && (result.status === 'skipped' || result.status === 'rejected')) {
       QueueManager.markConfirmed(op.id);
     }
   }
