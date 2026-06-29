@@ -29183,15 +29183,96 @@ function _pbFinaliseRestore(me, dataRootId, role, pumpId, fbUser, fsDb, btn){
       return Promise.all(pumpReads);
     }).catch(function(e){ console.warn('[RESTORE] pumps read failed:',e.message||e); });
 
-  // ── STEP 3: Activate sync + render dashboard ──────────────────────────────
-  // All Firestore reads finish before this block runs. localStorage now contains
-  // the authoritative data from Firestore. SyncEngine activates AFTER this so
-  // subsequent StorageService writes go to both localStorage AND Firestore.
+  // ── STEP 3: Reload in-memory state + activate sync + render dashboard ────────
+  // All Firestore reads (p1, p2) finish before this block runs.
+  // localStorage now has authoritative Firestore data for every pump.
+  //
+  // CRITICAL: _pbInitStorage() ran at page load from STALE localStorage and
+  // populated in-memory globals (readings, stockData, expItems, CFG, _histCache).
+  // Those stale globals MUST be cleared and reloaded from fresh localStorage NOW,
+  // before _doGrantAccess() triggers dashboard rendering. Otherwise:
+  //
+  //   OVERRIDE #1 — switchToPump → saveSession() writes stale readings/stockData
+  //                 → overwrites pb-session-v1__pN (just written from Firestore)
+  //                 → loadSession() reads back STALE data
+  //
+  //   OVERRIDE #2 — switchToPump → writeSnapshot() writes stale _liveTotals()
+  //                 → overwrites pb-snap-v1__pN (just written from Firestore)
+  //
+  //   OVERRIDE #3 — enterManagerMode(ACTIVE_PUMP===id) skips switchToPump entirely
+  //                 → no _clearLiveState / loadCarryForward called
+  //                 → stale carry-forward openings remain in memory forever
+  //
+  //   OVERRIDE #4 — renderOwnerDashboard → _pbLoadPumpData → for ACTIVE_PUMP uses
+  //                 _liveTotals() (stale memory) instead of fresh Firestore snapshot
+  //
+  // Fix: before _doGrantAccess, set ACTIVE_PUMP + clear all stale memory + reload
+  // all in-memory state from the fresh localStorage we just populated above.
   return Promise.all([p1,p2]).then(function(){
-    console.info('[RESTORE] Firestore data loaded. Activating sync…');
+    console.info('[RESTORE] Firestore data written to localStorage. Reloading in-memory state…');
+
+    // ── PRE-ACTIVATE: clear stale globals, reload from Firestore-fresh localStorage ──
+    window.__PB_SOURCE = 'FIRESTORE';
+    try{
+      // 1. Set ACTIVE_PUMP to the user's target pump BEFORE reading config/history/session.
+      //    For managers: pumpId (from JWT or userProfile). For owners: preserve or default to p1.
+      var _restorePump = pumpId || me.pumpId || StorageService.loadActivePump() || 'p1';
+      ACTIVE_PUMP = _restorePump;
+      StorageService.saveActivePump(_restorePump);
+      console.log('[OVERRIDE CHECK] ACTIVE_PUMP='+_restorePump+' set before in-memory reload');
+
+      // 2. Invalidate history cache so loadCarryForward reads fresh localStorage.
+      //    (BUG-H1 cache was populated at page load with stale data.)
+      try{ _histCache=null; _histCachePump=null; }catch(e){}
+      console.log('[OVERRIDE CHECK] _histCache invalidated');
+
+      // 3. Clear all stale live state: readings, stockData, expItems, confirmed totals.
+      if(typeof _clearLiveState==='function'){
+        _clearLiveState();
+        console.log('[OVERRIDE CHECK] _clearLiveState() done — stale page-load memory wiped');
+      }
+
+      // 4. Reload global config (currency, PIN lock) from fresh pb-global-cfg-v1.
+      if(typeof loadGCFG==='function'){
+        loadGCFG();
+        console.log('[OVERRIDE CHECK] loadGCFG → [DATA SOURCE] Firestore');
+      }
+
+      // 5. Reload pump config (prices, openings, categories) from fresh pump_settings_v1__pN.
+      if(typeof loadCFG==='function'){
+        loadCFG();
+        if(typeof applyCFG==='function') applyCFG();
+        console.log('[OVERRIDE CHECK] loadCFG pid='+_restorePump+' → [DATA SOURCE] Firestore');
+      }
+
+      // 6. Reload carry-forward (yesterday closings → today openings) from fresh pump_history_v1__pN.
+      //    This sets readings[f][n].open and stockData[f].open for the active pump.
+      if(typeof loadCarryForward==='function'){
+        loadCarryForward();
+        console.log('[OVERRIDE CHECK] loadCarryForward pid='+_restorePump+' → [DATA SOURCE] Firestore');
+      }
+
+      // 7. Reload today's in-progress session from fresh pb-session-v1__pN.
+      //    This sets expItems, cardItems, readings[f][n] close values, shiftIdx, etc.
+      //    After this, saveSession() in switchToPump will write CORRECT data (not stale).
+      if(typeof loadSession==='function'){
+        var _sessionOk=loadSession();
+        console.log('[OVERRIDE CHECK] loadSession pid='+_restorePump+' found='+_sessionOk+' → [DATA SOURCE] Firestore');
+        if(!_sessionOk){
+          console.log('[DATA SOURCE] No in-progress session for today — clean slate (correct for new day or new device)');
+        }
+      }
+    }catch(reloadErr){
+      console.warn('[RESTORE] In-memory reload error (non-fatal):',reloadErr.message||reloadErr);
+    }
+
+    // ── ACTIVATE SYNC ─────────────────────────────────────────────────────────
+    // SyncEngine activates AFTER all localStorage writes so SyncEngine.ACTIVE=true
+    // does not intercept the writes above (avoids queuing reads as cloud writes).
     localStorage.setItem('pb-sync-active','1');
     _activateSyncEngine(fsDb, dataRootId);
-    // Flush any writes queued while offline during restore
+
+    // Flush any offline write-queue accumulated while this restore was running
     try{
       if(typeof PB_FirestoreWriter !== 'undefined') PB_FirestoreWriter.flush().catch(function(){});
       if(typeof PB_QueueReplayEngine !== 'undefined' && typeof PB_FirestoreWriter !== 'undefined'){
