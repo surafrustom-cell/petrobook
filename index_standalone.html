@@ -29071,30 +29071,127 @@ function _pbResolveUserCompany(fbUser, fsDb){
 
 function _pbFinaliseRestore(me, dataRootId, role, pumpId, fbUser, fsDb, btn){
   var prefix = (typeof PB_FIRESTORE_PATHS !== 'undefined') ? PB_FIRESTORE_PATHS.getPrefix() : 'companies'; // V5: companies/ is the only path
-  var p1 = fsDb.doc(prefix+'/'+dataRootId+'/global/config').get()
+  var _base = prefix+'/'+dataRootId;
+
+  // ── STEP 1: Global config ─────────────────────────────────────────────────
+  var p1 = fsDb.doc(_base+'/global/config').get()
     .then(function(d){
       if(d.exists){
         var g=Object.assign({},d.data()); delete g._syncedAt; delete g._v;
         localStorage.setItem('pb-global-cfg-v1',JSON.stringify(g));
+        console.log('[DATA SOURCE] Firestore — global/config');
+      } else {
+        console.log('[DATA SOURCE] LocalStorage — global/config (Firestore doc missing)');
       }
-    }).catch(function(e){ console.warn('[PetroBook] global/config read failed:',e.message||e); });
-  var p2 = fsDb.collection(prefix+'/'+dataRootId+'/pumps').get()
+    }).catch(function(e){ console.warn('[RESTORE] global/config read failed:',e.message||e); });
+
+  // ── STEP 2: Pump list + per-pump data ────────────────────────────────────
+  // Firestore is the single source of truth. After reading the pump list, for
+  // EACH pump we pull: config, snapshot, fuelHistory, history (last 90 days),
+  // today's session record. All written to localStorage BEFORE SyncEngine
+  // activates so switchToPump() / loadCFG() / loadCarryForward() find fresh data.
+  var p2 = fsDb.collection(_base+'/pumps').get()
     .then(function(ps){
-      if(!ps.empty){
-        var pumps=[];
-        ps.forEach(function(d){
-          var p=Object.assign({},d.data()); delete p._syncedAt; delete p._v;
-          pumps.push(p);
-        });
-        localStorage.setItem('pb-pumps-v1',JSON.stringify(pumps));
+      if(ps.empty){
+        console.log('[DATA SOURCE] LocalStorage — pumps (Firestore collection empty)');
+        return;
       }
-    }).catch(function(e){ console.warn('[PetroBook] pumps read failed:',e.message||e); });
+      var pumps=[];
+      ps.forEach(function(d){
+        var p=Object.assign({},d.data()); delete p._syncedAt; delete p._v;
+        pumps.push(p);
+      });
+      localStorage.setItem('pb-pumps-v1',JSON.stringify(pumps));
+      console.log('[DATA SOURCE] Firestore — pumps list ('+pumps.length+' pump(s))');
+
+      // Today's date string (YYYY-MM-DD, local timezone) — same format as loadSession()
+      var now=new Date();
+      var todayKey=now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-'+String(now.getDate()).padStart(2,'0');
+      // 90-day history cutoff
+      var cutoffDate=new Date(now); cutoffDate.setDate(cutoffDate.getDate()-90);
+      var cutoff=cutoffDate.getFullYear()+'-'+String(cutoffDate.getMonth()+1).padStart(2,'0')+'-'+String(cutoffDate.getDate()).padStart(2,'0');
+
+      // Per-pump reads — all in parallel, all non-fatal
+      var pumpReads=pumps.map(function(pump){
+        var pid=pump.id; if(!pid) return Promise.resolve();
+        var pBase=_base+'/pumps/'+pid;
+
+        // Config (prices, openings, categories)
+        var rCfg=fsDb.doc(pBase+'/data/config').get().then(function(cd){
+          if(cd.exists){
+            var cfg=Object.assign({},cd.data()); delete cfg._syncedAt; delete cfg._v;
+            StorageService.saveExpense(cfg,pid);
+            console.log('[DATA SOURCE] Firestore — pumps/'+pid+'/data/config');
+          } else {
+            console.log('[DATA SOURCE] LocalStorage — pumps/'+pid+'/data/config (Firestore missing)');
+          }
+        }).catch(function(e){ console.warn('[RESTORE] config/'+pid+':',e.message||e); });
+
+        // Snapshot (live totals: cash, bank, sale, stockVal)
+        var rSnap=fsDb.doc(pBase+'/data/snapshot').get().then(function(sd){
+          if(sd.exists){
+            var snap=Object.assign({},sd.data()); delete snap._syncedAt; delete snap._v;
+            StorageService.saveStock(snap,pid);
+            console.log('[DATA SOURCE] Firestore — pumps/'+pid+'/data/snapshot cash='+(snap.cash||0)+' bank='+(snap.bank||0));
+          } else {
+            console.log('[DATA SOURCE] LocalStorage — pumps/'+pid+'/data/snapshot (Firestore missing)');
+          }
+        }).catch(function(e){ console.warn('[RESTORE] snapshot/'+pid+':',e.message||e); });
+
+        // Fuel price history
+        var rFuel=fsDb.doc(pBase+'/data/fuelHistory').get().then(function(fh){
+          if(fh.exists){
+            var prices=fh.data().prices||[];
+            StorageService.saveFuelHistory(prices,pid);
+            console.log('[DATA SOURCE] Firestore — pumps/'+pid+'/data/fuelHistory ('+prices.length+' entries)');
+          } else {
+            console.log('[DATA SOURCE] LocalStorage — pumps/'+pid+'/data/fuelHistory (Firestore missing)');
+          }
+        }).catch(function(e){ console.warn('[RESTORE] fuelHistory/'+pid+':',e.message||e); });
+
+        // Daily history (last 90 days) — builds the pump_history_v1 object loadCarryForward() reads
+        var rHist=fsDb.collection(pBase+'/history')
+          .where(firebase.firestore.FieldPath.documentId(),'>=',cutoff)
+          .get().then(function(hs){
+            if(!hs.empty){
+              var hist={};
+              hs.forEach(function(d){
+                var r=Object.assign({},d.data()); delete r._syncedAt; delete r._v;
+                hist[d.id]=r;
+              });
+              StorageService.saveReport(hist,pid);
+              console.log('[DATA SOURCE] Firestore — pumps/'+pid+'/history ('+hs.size+' records, cutoff '+cutoff+')');
+            } else {
+              console.log('[DATA SOURCE] LocalStorage — pumps/'+pid+'/history (Firestore empty since '+cutoff+')');
+            }
+          }).catch(function(e){ console.warn('[RESTORE] history/'+pid+':',e.message||e); });
+
+        // Today's in-progress session — what the manager entered today so far
+        var rRec=fsDb.doc(pBase+'/records/'+todayKey).get().then(function(rd){
+          if(rd.exists){
+            var rec=Object.assign({},rd.data()); delete rec._syncedAt; delete rec._v;
+            StorageService.saveRecord(rec,pid);
+            console.log('[DATA SOURCE] Firestore — pumps/'+pid+'/records/'+todayKey);
+          } else {
+            console.log('[DATA SOURCE] LocalStorage — pumps/'+pid+'/records/'+todayKey+' (Firestore missing — fresh day)');
+          }
+        }).catch(function(e){ console.warn('[RESTORE] records/'+pid+':',e.message||e); });
+
+        return Promise.all([rCfg,rSnap,rFuel,rHist,rRec]);
+      });
+
+      return Promise.all(pumpReads);
+    }).catch(function(e){ console.warn('[RESTORE] pumps read failed:',e.message||e); });
+
+  // ── STEP 3: Activate sync + render dashboard ──────────────────────────────
+  // All Firestore reads finish before this block runs. localStorage now contains
+  // the authoritative data from Firestore. SyncEngine activates AFTER this so
+  // subsequent StorageService writes go to both localStorage AND Firestore.
   return Promise.all([p1,p2]).then(function(){
-    console.info('[RESTORE] Config + pumps loaded from Firestore. Activating sync…');
+    console.info('[RESTORE] Firestore data loaded. Activating sync…');
     localStorage.setItem('pb-sync-active','1');
-    // Auth V4: use shared helper — activates SyncEngine, StorageService, PB_FirestoreWriter, PB_AuthBridge
     _activateSyncEngine(fsDb, dataRootId);
-    // Flush any offline queue accumulated during restore
+    // Flush any writes queued while offline during restore
     try{
       if(typeof PB_FirestoreWriter !== 'undefined') PB_FirestoreWriter.flush().catch(function(){});
       if(typeof PB_QueueReplayEngine !== 'undefined' && typeof PB_FirestoreWriter !== 'undefined'){
