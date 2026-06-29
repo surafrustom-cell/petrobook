@@ -3623,6 +3623,111 @@ html[lang="bn"] .i18n-pill .i18n-label{font-size:12px;}
 /* Day separator */
 .mr-day-sep{font-size:9.5px;font-weight:700;color:#9ca3af;text-transform:uppercase;letter-spacing:.5px;padding:4px 2px 0;}
 
+/* ══ PROFIT SUMMARY REPORT — desktop modal (≥1024px) ═════════════════════════ */
+@media(min-width:1024px){
+  /* Overlay → centred dialog backdrop */
+  #mr-ovl{
+    background:rgba(0,0,0,.52)!important;
+    backdrop-filter:blur(8px)!important;
+    -webkit-backdrop-filter:blur(8px)!important;
+    align-items:center!important;
+    justify-content:center!important;
+    pointer-events:none!important;
+  }
+  #mr-ovl.open{pointer-events:auto!important;}
+  /* Sheet → centred dialog box */
+  #mr-ovl .sheet{
+    position:relative!important;
+    inset:auto!important;
+    width:min(1100px,90vw)!important;
+    max-width:90vw!important;
+    max-height:90vh!important;
+    border-radius:24px!important;
+    box-shadow:0 32px 96px rgba(0,0,0,.30),0 0 0 1px rgba(255,255,255,.06)!important;
+    transform:scale(.96) translateY(18px)!important;
+    opacity:0!important;
+    transition:transform .3s cubic-bezier(.32,1,.52,1),opacity .25s ease!important;
+    will-change:transform,opacity;
+    overflow:hidden!important;
+  }
+  #mr-ovl.open .sheet{
+    transform:scale(1) translateY(0)!important;
+    opacity:1!important;
+  }
+  /* Header — wider padding, larger typography */
+  .mr-fixed-hdr{padding:max(16px,10px) 28px 0!important;}
+  .mr-hdr-row{margin-bottom:14px!important;}
+  .mr-hdr-title{font-size:20px!important;letter-spacing:-.6px!important;}
+  .mr-hdr-subtitle{font-size:11px!important;}
+  .mr-back-btn{font-size:15px!important;}
+  .mr-hdr-icon-btn{width:36px!important;height:36px!important;border-radius:12px!important;}
+  /* Date bar */
+  .mr-date-bar{border-radius:14px!important;margin-bottom:16px!important;}
+  .mr-date-field{padding:10px 20px!important;}
+  .mr-date-lbl{font-size:9px!important;}
+  .mr-date-val{font-size:15px!important;}
+  /* Scroll body */
+  .mr-body{padding:20px 28px 36px!important;gap:16px!important;}
+  /* Summary 3-card row */
+  .mr-sum-row{gap:14px!important;}
+  .mr-sum-card{padding:18px 16px 16px!important;border-radius:16px!important;}
+  .mr-sum-ico-wrap{width:36px!important;height:36px!important;border-radius:11px!important;margin-bottom:10px!important;}
+  .mr-sum-lbl{font-size:9px!important;}
+  .mr-sum-val{font-size:17px!important;}
+  .mr-sum-sub{font-size:9px!important;}
+  /* Fuel segment bar */
+  .mr-fuel-card{border-radius:16px!important;}
+  .mr-fuel-seg{padding:14px 6px 13px!important;}
+  .mr-fseg-ico{width:32px!important;height:32px!important;border-radius:10px!important;}
+  .mr-fseg-name{font-size:9px!important;}
+  .mr-fseg-liters{font-size:17px!important;}
+  .mr-fseg-rev{font-size:10px!important;padding:3px 8px!important;}
+  /* Fuel details table card */
+  .mr-tcard{border-radius:16px!important;}
+  .mr-tcard-hdr{padding:14px 20px 12px!important;}
+  .mr-tcard-title{font-size:14px!important;}
+  .mr-tcard-hdr-ico{width:30px!important;height:30px!important;border-radius:9px!important;}
+  .mr-ftbl thead th{padding:9px 8px!important;font-size:8.5px!important;}
+  .mr-ftbl thead th:first-child{padding-left:20px!important;}
+  .mr-ftbl tbody td{padding:13px 8px!important;font-size:11.5px!important;}
+  .mr-ftbl tbody td:first-child{padding-left:20px!important;}
+  .mr-fc-name{font-size:12px!important;}
+  .mr-fc-price{font-size:9px!important;}
+  .mr-rev-pill{font-size:10px!important;padding:3px 8px!important;}
+  /* Profit breakdown card */
+  .mr-pcard{border-radius:16px!important;}
+  .mr-pb-hdr{padding:14px 20px 12px!important;}
+  .mr-pb-hdr-title{font-size:14px!important;}
+  .mr-pb-hdr-ico{width:30px!important;height:30px!important;border-radius:9px!important;}
+  .mr-pbr{padding:13px 20px!important;gap:14px!important;}
+  .mr-pbr-ico{width:30px!important;height:30px!important;border-radius:9px!important;}
+  .mr-pbr-lbl{font-size:14px!important;}
+  .mr-pbr-sub{font-size:9px!important;}
+  .mr-pbr-val{font-size:17px!important;}
+  .mr-fct-wrap{margin:0 18px 8px!important;border-radius:12px!important;}
+  .mr-fct-hdr{padding:7px 14px!important;}
+  .mr-fct-hdr span{font-size:8px!important;}
+  .mr-fct-row{padding:10px 14px!important;}
+  .mr-fct-row span{font-size:11px!important;}
+  .mr-fct-total{padding:12px 20px!important;}
+  .mr-fct-total-lbl{font-size:14px!important;}
+  .mr-fct-total-val{font-size:17px!important;}
+  .mr-pb-net{padding:20px 20px!important;}
+  .mr-pb-net-lbl{font-size:13px!important;}
+  .mr-pb-net-sub{font-size:9.5px!important;}
+  .mr-pb-net-val{font-size:30px!important;letter-spacing:-1px!important;}
+  /* Info cards row */
+  .mr-info-row{gap:12px!important;}
+  .mr-info-card{padding:16px 14px!important;border-radius:14px!important;}
+  .mr-info-ico{width:32px!important;height:32px!important;border-radius:10px!important;}
+  .mr-info-lbl{font-size:8.5px!important;}
+  .mr-info-val{font-size:14px!important;}
+  .mr-info-sub{font-size:9px!important;}
+  /* Footer */
+  .mr-footer{padding:6px 0 0!important;}
+  .mr-footer-txt{font-size:11px!important;}
+}
+
 /* ══════════════════════════════════════════════════════
    EXECUTIVE SUMMARY — Financial & Stock Cards
 */
@@ -35567,9 +35672,11 @@ function openMeterReport() {
   const el = document.getElementById('mr-ovl');
   if (!el) return;
   el.classList.add('open');
-  // Ensure sheet uses translateX animation (full-page mode)
+  // Full-page slide animation on mobile only; desktop uses centred dialog via CSS
   const sheet = el.querySelector('.sheet');
-  if(sheet) sheet.style.borderRadius='0';
+  if(sheet && window.innerWidth < 1024) sheet.style.borderRadius='0';
+  // Lock background scroll while modal is open
+  document.body.style.overflow='hidden';
   loadCFG(); // always read latest settings before rendering
   const today = _localDateStr();
   const si = document.getElementById('mr-start');
@@ -35612,6 +35719,8 @@ function mrUpdateLabels(){
 function closeMeterReport() {
   const el = document.getElementById('mr-ovl');
   if (el) el.classList.remove('open');
+  // Restore background scroll
+  document.body.style.overflow='';
 }
 
 // ── Period / Fuel filter setters ──────────────────────────────────────────────
