@@ -3625,16 +3625,22 @@ html[lang="bn"] .i18n-pill .i18n-label{font-size:12px;}
 
 /* ══ PROFIT SUMMARY REPORT — desktop modal (≥1024px) ═════════════════════════ */
 @media(min-width:1024px){
-  /* Overlay → centred dialog backdrop */
+  /* Overlay → centred dialog backdrop.
+     IMPORTANT: background/blur ONLY on .open — never on the hidden overlay. */
   #mr-ovl{
-    background:rgba(0,0,0,.52)!important;
-    backdrop-filter:blur(8px)!important;
-    -webkit-backdrop-filter:blur(8px)!important;
     align-items:center!important;
     justify-content:center!important;
     pointer-events:none!important;
+    background:transparent!important;
+    backdrop-filter:none!important;
+    -webkit-backdrop-filter:none!important;
   }
-  #mr-ovl.open{pointer-events:auto!important;}
+  #mr-ovl.open{
+    pointer-events:auto!important;
+    background:rgba(0,0,0,.52)!important;
+    backdrop-filter:blur(8px)!important;
+    -webkit-backdrop-filter:blur(8px)!important;
+  }
   /* Sheet → centred dialog box */
   #mr-ovl .sheet{
     position:relative!important;
@@ -10848,7 +10854,7 @@ tr:last-child td{border-bottom:none}
 </div>
 
 <!-- ══ METER READING REPORT OVERLAY ══ -->
-<div class="ovl" id="mr-ovl" style="z-index:700">
+<div class="ovl" id="mr-ovl" style="z-index:700" onclick="if(event.target===this)closeMeterReport()">
   <div class="sheet fullsheet" style="max-height:100dvh;display:flex;flex-direction:column;border-radius:var(--r20) var(--r20) 0 0;background:#f4f6f9;">
     <div class="mr-fixed-hdr">
       <div class="mr-hdr-row">
@@ -35722,6 +35728,115 @@ function closeMeterReport() {
   // Restore background scroll
   document.body.style.overflow='';
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// GLOBAL OVERLAY SAFETY SYSTEM
+// Prevents permanently blurred / locked UI if any modal fails to clean up.
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * closeAllModals() — hard-resets every overlay, blur, scroll-lock and
+ * pointer-events state.  Safe to call from error handlers / ESC / watchdog.
+ */
+window.closeAllModals = function closeAllModals() {
+  // --- 1. Standard .ovl overlays (slide-up sheets) --------------------------
+  var ovlIds = [
+    'ov-pnl','ov-read','ov-stk','ov-exp','ov-card',
+    'ov-tcash','ov-tbank','ov-next-day','ov-save-summary',
+    'mr-ovl','pb-login'
+  ];
+  ovlIds.forEach(function(id){
+    var el = document.getElementById(id);
+    if(el){ el.classList.remove('open'); el.style.pointerEvents=''; }
+  });
+
+  // --- 2. st-ovl / custom overlays (side-drawers) ---------------------------
+  var stOvlIds = [
+    'ov-settings','pb-um-ovl','pb-mgr-ov','pa-ovl'
+  ];
+  stOvlIds.forEach(function(id){
+    var el = document.getElementById(id);
+    if(el){ el.classList.remove('open','active'); el.style.pointerEvents=''; }
+  });
+
+  // --- 3. QuickView ---------------------------------------------------------
+  var qv = document.getElementById('qv-ovl');
+  if(qv) qv.classList.remove('open');
+
+  // --- 4. Statement overlay -------------------------------------------------
+  var stmt = document.getElementById('stmt-ovl');
+  if(stmt){ stmt.classList.remove('open','active'); }
+
+  // --- 5. History detail ----------------------------------------------------
+  var hd = document.getElementById('hd-ovl');
+  if(hd){ hd.classList.remove('hd-open','hd-close'); }
+
+  // --- 6. Entry categories --------------------------------------------------
+  var ec = document.getElementById('ec-ovl');
+  if(ec){ ec.classList.remove('open'); }
+
+  // --- 7. Transaction detail ------------------------------------------------
+  var txn = document.getElementById('txn-detail-ovl');
+  if(txn){ txn.classList.remove('open'); }
+
+  // --- 8. Restore body scroll + pointer events ------------------------------
+  document.body.style.overflow = '';
+  document.body.style.pointerEvents = '';
+
+  // --- 9. Strip any rogue backdrop-filter left on body or #app --------------
+  [document.body, document.getElementById('app')].forEach(function(el){
+    if(el){ el.style.backdropFilter=''; el.style.webkitBackdropFilter=''; }
+  });
+
+  console.info('[PetroBook] closeAllModals() — all overlays reset');
+};
+
+// ── Global ESC key → closeAllModals ──────────────────────────────────────────
+document.addEventListener('keydown', function(e) {
+  if (e.key !== 'Escape') return;
+  // Only act if at least one overlay is currently open
+  var anyOpen = document.querySelector(
+    '#mr-ovl.open, #ov-read.open, #ov-stk.open, #ov-exp.open, ' +
+    '#ov-card.open, #ov-tcash.open, #ov-tbank.open, ' +
+    '#ov-next-day.open, #ov-save-summary.open, ' +
+    '#qv-ovl.open, .hd-ovl.hd-open, #pb-um-ovl.open, ' +
+    '#pb-mgr-ov.open, #pa-ovl.open, #ec-ovl.open'
+  );
+  if (anyOpen) {
+    e.preventDefault();
+    window.closeAllModals();
+  }
+}, { passive: false });
+
+// ── Watchdog: every 2 s, if body is scroll-locked but nothing is open ────────
+(function _pbOverlayWatchdog() {
+  setInterval(function() {
+    try {
+      if (document.body.style.overflow !== 'hidden') return; // nothing locked
+      // Check if any legitimate modal is open
+      var legitimateOpen = document.querySelector(
+        '#mr-ovl.open, #hd-ovl.hd-open'
+      );
+      if (!legitimateOpen) {
+        console.warn('[PetroBook] Watchdog: scroll lock without open modal — restoring');
+        document.body.style.overflow = '';
+      }
+    } catch(e) { /* watchdog must never throw */ }
+  }, 2000);
+})();
+
+// ── Error-handler safety net: closeAllModals on unhandled JS errors ───────────
+(function _pbErrorSafety() {
+  var _origOnerror = window.onerror;
+  window.onerror = function(msg, src, line, col, err) {
+    // Only auto-close if scroll is locked (modal was open when error fired)
+    if (document.body.style.overflow === 'hidden') {
+      try { window.closeAllModals(); } catch(e2) {}
+    }
+    if (typeof _origOnerror === 'function') return _origOnerror(msg, src, line, col, err);
+    return false;
+  };
+})();
 
 // ── Period / Fuel filter setters ──────────────────────────────────────────────
 function mrSetPeriod(btn, period, skipRender) {
