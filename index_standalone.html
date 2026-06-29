@@ -12751,13 +12751,16 @@ var SyncEngine = (function () {
     if (!op || !op.id) return;
 
     if (typeof PB_FirestoreWriter === 'undefined' || !PB_FirestoreWriter.isReady()) {
-      // Writer not available — mark confirmed locally (offline-first, no data loss)
-      QueueManager.markConfirmed(op.id);
+      // Writer not ready yet — leave op PENDING in QueueManager for replayAll.
+      // BUG-W1 FIX: do NOT markConfirmed here — data has not reached Firestore.
+      // replayAll() will retry with fresh localStorage data when the writer activates.
+      console.warn('[WRITE FAILED] '+op.type+' id='+op.id+' — PB_FirestoreWriter not ready. Leaving pending for replay.');
       return;
     }
 
     // Skip device-only ops — data lives in localStorage only, never Firestore
     if (typeof PB_SYNC_OP_MAP !== 'undefined' && PB_SYNC_OP_MAP.isDeviceOnly(op.type)) {
+      console.log('[QUEUE CONFIRMED] '+op.type+' device-only — no Firestore write. id='+op.id);
       QueueManager.markConfirmed(op.id);
       return;
     }
@@ -12782,19 +12785,30 @@ var SyncEngine = (function () {
             return { path: itemPath, data: d.data || d, options: { merge: false } };
           }).filter(function(d) { return d.path; });
           if (items.length) {
+            items.forEach(function(it){ console.log('[FIRESTORE PATH] '+op.type+' → '+it.path); });
+            console.log('[WRITE START] '+op.type+' fan-out '+items.length+' doc(s). id='+op.id);
             PB_FirestoreWriter.batchWrite(items)
               .then(function() {
+                console.log('[WRITE SUCCESS] '+op.type+' batchWrite '+items.length+' doc(s). id='+op.id);
+                console.log('[QUEUE CONFIRMED] '+op.type+' batchWrite confirmed. id='+op.id);
                 QueueManager.markConfirmed(op.id);
                 SyncStatusManager.setStatus('synced');
               })
               .catch(function(e) {
-                console.warn('[SyncEngine] _cloudWrite batchWrite error:', e);
+                console.error('[WRITE FAILED] '+op.type+' batchWrite id='+op.id+' err='+(e&&e.message?e.message:String(e)));
+                QueueManager.markFailed(op.id, e && e.message ? e.message : String(e));
                 SyncStatusManager.setStatus('error', e && e.message ? e.message : String(e));
               });
           } else {
             // Empty batch (e.g. no users or no report dates) — nothing to write
             QueueManager.markConfirmed(op.id);
           }
+          return;
+        }
+
+        if (!path) {
+          console.error('[WRITE FAILED] '+op.type+' — null path from PB_SYNC_OP_MAP. id='+op.id);
+          QueueManager.markConfirmed(op.id); // bad op, won't succeed on retry
           return;
         }
 
@@ -12809,32 +12823,70 @@ var SyncEngine = (function () {
           timestamp: op.timestamp,
         };
 
+        console.log('[QUEUE ADD] '+op.type+' [FIRESTORE PATH] '+path+' id='+op.id);
         var result = PB_FirestoreWriter.enqueue(cloudOp);
         if (result && result.status === 'queued') {
+          console.log('[WRITE START] '+op.type+' path='+path+' id='+op.id);
           PB_FirestoreWriter.flush().then(function(r) {
-            if (r && r.status === 'ok') SyncStatusManager.setStatus('synced');
+            // Confirm only if THIS op actually succeeded in the flush.
+            var myResult = r && r.results && r.results.filter(function(x){return x.id===op.id;})[0];
+            var succeeded = myResult ? myResult.status==='ok' : (r && r.status==='ok' && !r.remaining);
+            if(succeeded){
+              console.log('[WRITE SUCCESS] '+op.type+' path='+path+' id='+op.id);
+              console.log('[QUEUE CONFIRMED] '+op.type+' Firestore write confirmed. id='+op.id);
+              QueueManager.markConfirmed(op.id);
+              SyncStatusManager.setStatus('synced');
+            } else {
+              // Op stayed in PB_FirestoreWriter._queue (retrying) — leave QueueManager pending too
+              console.warn('[WRITE FAILED] '+op.type+' not confirmed in flush. status='+(myResult&&myResult.status||r&&r.status)+' id='+op.id);
+              SyncStatusManager.setStatus('error', op.type+' write not confirmed');
+            }
           }).catch(function(e) {
-            console.warn('[SyncEngine] _cloudWrite flush error:', e);
+            console.error('[WRITE FAILED] '+op.type+' path='+path+' flush error id='+op.id+' err='+(e&&e.message?e.message:String(e)));
             SyncStatusManager.setStatus('error', e && e.message ? e.message : String(e));
           });
-        } else if (result && (result.status === 'skipped' || result.status === 'rejected')) {
-          QueueManager.markConfirmed(op.id);
+        } else if (result && result.status === 'skipped') {
+          // BUG-W1 FIX: enqueue skipped because writer became inactive between isReady() check
+          // and enqueue() call. Leave pending — do NOT markConfirmed. replayAll will retry.
+          console.warn('[WRITE FAILED] '+op.type+' enqueue skipped (writer inactive). Leaving pending. id='+op.id);
+        } else if (result && result.status === 'rejected') {
+          // Validation failure — this exact write cannot succeed. Log and discard.
+          console.error('[WRITE FAILED] '+op.type+' enqueue rejected: '+JSON.stringify(result.errors)+' id='+op.id);
+          QueueManager.markConfirmed(op.id); // not a retry-able error
+        } else if (result && result.status === 'throttled') {
+          // Snapshot throttled — QueueManager op stays pending; replayQueue retries after 10s
+          console.log('[QUEUE ADD] '+op.type+' throttled (snapshot rate limit). Will retry via replayQueue. id='+op.id);
         }
-        // throttled: leave QueueManager pending — replayQueue will retry
+        // busy/other: leave QueueManager pending — next flush will pick up the PB_FirestoreWriter._queue entry
         return;
       }
     }
 
-    // Fallback: PB_SYNC_OP_MAP unavailable or no mapEntry — pass raw op as before
+    // Fallback: PB_SYNC_OP_MAP unavailable or no mapEntry — pass raw op
+    // (should never happen in production — all op types are in PB_SYNC_OP_MAP)
+    console.warn('[WRITE FAILED] '+op.type+' — no PB_SYNC_OP_MAP entry. Raw op fallback. id='+op.id);
     var result = PB_FirestoreWriter.enqueue(op);
     if (result && result.status === 'queued') {
       PB_FirestoreWriter.flush().then(function(r) {
-        if (r && r.status === 'ok') SyncStatusManager.setStatus('synced');
+        var myResult = r && r.results && r.results.filter(function(x){return x.id===op.id;})[0];
+        var succeeded = myResult ? myResult.status==='ok' : (r && r.status==='ok' && !r.remaining);
+        if(succeeded){
+          console.log('[WRITE SUCCESS] '+op.type+' (fallback) id='+op.id);
+          console.log('[QUEUE CONFIRMED] '+op.type+' fallback confirmed. id='+op.id);
+          QueueManager.markConfirmed(op.id);
+          SyncStatusManager.setStatus('synced');
+        } else {
+          console.warn('[WRITE FAILED] '+op.type+' fallback not confirmed. id='+op.id);
+          SyncStatusManager.setStatus('error', op.type+' fallback write not confirmed');
+        }
       }).catch(function(e) {
-        console.warn('[SyncEngine] _cloudWrite flush error:', e);
+        console.error('[WRITE FAILED] '+op.type+' fallback flush error='+(e&&e.message?e.message:String(e))+' id='+op.id);
         SyncStatusManager.setStatus('error', e && e.message ? e.message : String(e));
       });
-    } else if (result && (result.status === 'skipped' || result.status === 'rejected')) {
+    } else if (result && result.status === 'skipped') {
+      console.warn('[WRITE FAILED] '+op.type+' fallback enqueue skipped. Leaving pending. id='+op.id);
+    } else if (result && result.status === 'rejected') {
+      console.error('[WRITE FAILED] '+op.type+' fallback rejected: '+JSON.stringify(result.errors)+' id='+op.id);
       QueueManager.markConfirmed(op.id);
     }
   }
@@ -13560,7 +13612,34 @@ var PB_QueueReplayEngine = (function () {
     }
     var aid = (typeof PB_FirestoreWriter !== 'undefined') ? PB_FirestoreWriter.getAccountId() : null;
     var pid = op.pumpId || null;
-    var args = op.payload ? [op.payload] : [];
+    // BUG-W7 FIX: op.payload is a stub {method, argCount} — never real data.
+    // Reconstruct args from fresh localStorage reads so Firestore gets the latest data,
+    // not the garbage stub that would corrupt the snapshot path.
+    var args = (function(){
+      try {
+        var ls = (typeof LocalStorageProvider !== 'undefined') ? LocalStorageProvider : null;
+        if (!ls) {
+          console.warn('[REPLAY] LocalStorageProvider unavailable — falling back to stub payload for '+op.type+' id='+op.id);
+          return op.payload ? [op.payload] : [];
+        }
+        var t = op.type;
+        if (t === 'saveRecord')      { var d = ls.loadRecord(pid);       return d ? [d, pid] : []; }
+        if (t === 'saveStock')       { var s = ls.loadStock(pid);        return s ? [s, pid] : []; }
+        if (t === 'saveExpense')     { var e = ls.loadExpense(pid);      return e ? [e, pid] : []; }
+        if (t === 'saveReport')      { var h = ls.loadReport(pid);       return h ? [h, pid] : []; }
+        if (t === 'saveFuelHistory') { var f = ls.loadFuelHistory(pid);  return f ? [f, pid] : []; }
+        if (t === 'saveUser')        { var u = ls.loadUsers();           return u ? [u]      : []; }
+        if (t === 'savePump')        { var p = ls.loadPumps();           return p ? [p]      : []; }
+        if (t === 'saveCash')        { var g = ls.loadCash();            return g ? [g]      : []; }
+        if (t === 'saveLang')        { var l = ls.loadLang('en');        return l ? [l]      : []; }
+        if (t === 'saveActivePump')  { var a = ls.loadActivePump();      return a ? [a]      : []; }
+      } catch(e2) {
+        console.warn('[REPLAY] args construction error for '+op.type+' id='+op.id+':', e2);
+      }
+      // For any op type not handled above, payload stub is better than nothing
+      return op.payload ? [op.payload] : [];
+    })();
+    console.log('[QUEUE CONFIRMED] replayOne '+op.type+' pid='+pid+' id='+op.id+' args.length='+args.length);
     // Build Firestore path
     var path = mapEntry.path ? mapEntry.path(aid, pid, args) : null;
     // Build data via transform
@@ -13988,7 +14067,42 @@ var PB_FirestoreWriter = (function () {
     // Phase 4B: real Firestore flush — sends all pending queued ops.
     return Promise.all(pending.map(function(op) {
       return writeDocument(op.path, op.data, op.options)
-        .then(function() { _queue=_queue.filter(function(q){return q.id!==op.id;}); _stats.flushed++; return {id:op.id,status:'ok'}; })
+        .then(function(wr) {
+          // BUG-W6 FIX: writeDocument returns {status:'noop'} when writer became inactive
+          // between flush start and the actual write call. Treat this as a failed write —
+          // keep the op in _queue for retry rather than silently removing it.
+          if (wr && wr.status === 'noop') {
+            console.warn('[WRITE FAILED] flush noop id='+op.id+' type='+op.type+' — writer went inactive mid-flush. Retrying later.');
+            _queue = _queue.map(function(q){
+              return q.id === op.id
+                ? Object.assign({}, q, { status:'pending', nextAttemptAt: Date.now() + 3000 })
+                : q;
+            });
+            return { id: op.id, status: 'noop' };
+          }
+          if (wr && wr.status === 'verify_fail') {
+            // Read-back mismatch — do NOT remove from queue, do NOT let markConfirmed be called.
+            // Increment retry counter; dead-letter after 3 verify failures.
+            console.error('[WRITE FAILED] flush verify_fail id='+op.id+' type='+op.type+' path='+op.path+' reason='+(wr.reason||'?'));
+            _stats.failed++;
+            _queue = _queue.map(function(q){
+              if (q.id !== op.id) return q;
+              var r = (q.retries||0) + 1;
+              if (r >= 3) {
+                PB_QueueReplayEngine.deadLetter(q, 'verify_fail:' + (wr.reason||'?'));
+                return Object.assign({}, q, {status:'dead', retries:r, lastError:'verify_fail:' + (wr.reason||'?')});
+              }
+              return Object.assign({}, q, {status:'pending', retries:r,
+                nextAttemptAt: Date.now() + _nextRetryDelay(r),
+                lastError: 'verify_fail:' + (wr.reason||'?')});
+            });
+            return { id: op.id, status: 'verify_fail', reason: wr.reason };
+          }
+          console.log('[WRITE SUCCESS] flush writeDocument ok. id='+op.id+' path='+op.path);
+          _queue = _queue.filter(function(q){ return q.id !== op.id; });
+          _stats.flushed++;
+          return { id: op.id, status: 'ok' };
+        })
         .catch(function(e) {
           _queue=_queue.map(function(q){
             if(q.id!==op.id) return q;
@@ -14018,7 +14132,37 @@ var PB_FirestoreWriter = (function () {
     var ref = _db.doc(path);
     if (options && options.isDelete) return ref.delete().then(function(){ return {status:'ok',op:'delete',path:path}; });
     return ref.set(data, options && options.merge ? {merge:true} : undefined)
-              .then(function(){ return {status:'ok',op:'write',path:path}; });
+              .then(function(){
+                window.__PB_LAST_FS_WRITE = new Date().toISOString();
+                // BLOCKING read-back verify. Controls markConfirmed in _cloudWrite via flush().
+                //   verify_fail  → flush() keeps op in queue, _cloudWrite does NOT markConfirmed.
+                //   ok           → flush() removes op, _cloudWrite calls markConfirmed.
+                //   read error   → treated as ok (write SDK confirmed it; network issue on read)
+                return ref.get().then(function(snap) {
+                  if (!snap.exists) {
+                    console.error('[FIRESTORE VERIFY FAIL] document vanished after write! path='+path);
+                    return {status:'verify_fail', op:'write', path:path, reason:'doc_missing'};
+                  }
+                  var readData = snap.data();
+                  var mismatch = Object.keys(data).some(function(k) {
+                    if (k === '_syncedAt' || k === '_v') return false;
+                    return JSON.stringify(data[k]) !== JSON.stringify(readData[k]);
+                  });
+                  if (mismatch) {
+                    console.error('[FIRESTORE VERIFY FAIL] data mismatch — will NOT confirm. path='+path);
+                    console.error('[FIRESTORE VERIFY FAIL] written:  ' + JSON.stringify(data).slice(0,400));
+                    console.error('[FIRESTORE VERIFY FAIL] readback: ' + JSON.stringify(readData).slice(0,400));
+                    return {status:'verify_fail', op:'write', path:path, reason:'data_mismatch'};
+                  }
+                  console.log('[FIRESTORE VERIFY PASS] readback matches. path='+path+' at='+window.__PB_LAST_FS_WRITE);
+                  return {status:'ok', op:'write', path:path};
+                }).catch(function(e) {
+                  // Read-back network/permission error — cannot verify, optimistically accept
+                  // (Firestore SDK confirmed the set() call; mismatch can't be proven)
+                  console.warn('[FIRESTORE VERIFY] read-back error (treating as ok) path='+path+': '+(e.message||e));
+                  return {status:'ok', op:'write', path:path};
+                });
+              });
   }
 
   // deleteDocument(path)
@@ -29126,33 +29270,63 @@ function _pbFinaliseRestore(me, dataRootId, role, pumpId, fbUser, fsDb, btn){
         // Config (prices, openings, categories)
         var rCfg=fsDb.doc(pBase+'/data/config').get().then(function(cd){
           if(cd.exists){
-            var cfg=Object.assign({},cd.data()); delete cfg._syncedAt; delete cfg._v;
+            var rawCfg=cd.data();
+            console.log('[DATA VERIFY] config pid='+pid+' fsUpdated='+(rawCfg._syncedAt||'(none)')+' — Firestore applied (SOT)');
+            var cfg=Object.assign({},rawCfg); delete cfg._syncedAt; delete cfg._v;
             StorageService.saveExpense(cfg,pid);
             console.log('[DATA SOURCE] Firestore — pumps/'+pid+'/data/config');
           } else {
             console.log('[DATA SOURCE] LocalStorage — pumps/'+pid+'/data/config (Firestore missing)');
+            console.log('[DATA VERIFY] config pid='+pid+' source=LocalStorage (Firestore doc absent)');
           }
         }).catch(function(e){ console.warn('[RESTORE] config/'+pid+':',e.message||e); });
 
         // Snapshot (live totals: cash, bank, sale, stockVal)
         var rSnap=fsDb.doc(pBase+'/data/snapshot').get().then(function(sd){
+          window.__PB_LAST_FS_READ = new Date().toISOString();
           if(sd.exists){
-            var snap=Object.assign({},sd.data()); delete snap._syncedAt; delete snap._v;
+            var rawSnap=sd.data();
+            var fsSyncedAt=rawSnap._syncedAt||'(none)';
+            // [DATA VERIFY] Req 6: compare Firestore vs localStorage timestamps before overwriting
+            try {
+              var _lsSnapKey=(pid==='p1')?'pb-snap-v1':('pb-snap-v1__'+pid);
+              var _lsSnapRaw=localStorage.getItem(_lsSnapKey);
+              var _lsSnapData=_lsSnapRaw?JSON.parse(_lsSnapRaw):null;
+              var lsSyncedAt=_lsSnapData?(_lsSnapData._syncedAt||'(none)'):'(absent)';
+              // Req 7: Firestore always wins — warn if localStorage appears newer, apply Firestore anyway
+              if(fsSyncedAt!=='(none)'&&lsSyncedAt!=='(absent)'&&lsSyncedAt!=='(none)'&&fsSyncedAt<lsSyncedAt){
+                console.warn('[DATA VERIFY] snapshot pid='+pid
+                  +' fsUpdated='+fsSyncedAt+' lsUpdated='+lsSyncedAt
+                  +' — WARNING: localStorage is newer; Firestore WINS (SOT rule enforced)');
+              } else {
+                console.log('[DATA VERIFY] snapshot pid='+pid
+                  +' fsUpdated='+fsSyncedAt+' lsUpdated='+lsSyncedAt
+                  +' — Firestore applied (SOT)');
+              }
+              // Capture FS timestamp for DATA AUDIT report
+              window.__PB_FS_SNAP_TS=window.__PB_FS_SNAP_TS||{};
+              window.__PB_FS_SNAP_TS[pid]=fsSyncedAt;
+            } catch(e2) {}
+            var snap=Object.assign({},rawSnap); delete snap._syncedAt; delete snap._v;
             StorageService.saveStock(snap,pid);
             console.log('[DATA SOURCE] Firestore — pumps/'+pid+'/data/snapshot cash='+(snap.cash||0)+' bank='+(snap.bank||0));
           } else {
             console.log('[DATA SOURCE] LocalStorage — pumps/'+pid+'/data/snapshot (Firestore missing)');
+            console.log('[DATA VERIFY] snapshot pid='+pid+' source=LocalStorage (Firestore doc absent)');
           }
         }).catch(function(e){ console.warn('[RESTORE] snapshot/'+pid+':',e.message||e); });
 
         // Fuel price history
         var rFuel=fsDb.doc(pBase+'/data/fuelHistory').get().then(function(fh){
           if(fh.exists){
-            var prices=fh.data().prices||[];
+            var fhData=fh.data();
+            var prices=fhData.prices||[];
+            console.log('[DATA VERIFY] fuelHistory pid='+pid+' fsUpdated='+(fhData._syncedAt||'(none)')+' — Firestore applied (SOT)');
             StorageService.saveFuelHistory(prices,pid);
             console.log('[DATA SOURCE] Firestore — pumps/'+pid+'/data/fuelHistory ('+prices.length+' entries)');
           } else {
             console.log('[DATA SOURCE] LocalStorage — pumps/'+pid+'/data/fuelHistory (Firestore missing)');
+            console.log('[DATA VERIFY] fuelHistory pid='+pid+' source=LocalStorage (Firestore doc absent)');
           }
         }).catch(function(e){ console.warn('[RESTORE] fuelHistory/'+pid+':',e.message||e); });
 
@@ -29176,11 +29350,14 @@ function _pbFinaliseRestore(me, dataRootId, role, pumpId, fbUser, fsDb, btn){
         // Today's in-progress session — what the manager entered today so far
         var rRec=fsDb.doc(pBase+'/records/'+todayKey).get().then(function(rd){
           if(rd.exists){
-            var rec=Object.assign({},rd.data()); delete rec._syncedAt; delete rec._v;
+            var rawRec=rd.data();
+            console.log('[DATA VERIFY] session pid='+pid+' date='+todayKey+' fsUpdated='+(rawRec._syncedAt||'(none)')+' — Firestore applied (SOT)');
+            var rec=Object.assign({},rawRec); delete rec._syncedAt; delete rec._v;
             StorageService.saveRecord(rec,pid);
             console.log('[DATA SOURCE] Firestore — pumps/'+pid+'/records/'+todayKey);
           } else {
             console.log('[DATA SOURCE] LocalStorage — pumps/'+pid+'/records/'+todayKey+' (Firestore missing — fresh day)');
+            console.log('[DATA VERIFY] session pid='+pid+' date='+todayKey+' source=LocalStorage (Firestore doc absent — fresh day)');
           }
         }).catch(function(e){ console.warn('[RESTORE] records/'+pid+':',e.message||e); });
 
@@ -29298,6 +29475,27 @@ function _pbFinaliseRestore(me, dataRootId, role, pumpId, fbUser, fsDb, btn){
     // using the freshly reloaded in-memory state (which matches Firestore).
     window.PB_RESTORE_IN_PROGRESS = false;
     console.info('[RESTORE] Restore complete — lock released. [DATA SOURCE] now RuntimeMemory');
+
+    // ── Req 8: DATA AUDIT REPORT ─────────────────────────────────────────────
+    try {
+      var _auditPump = pumpId || (me && me.pumpId) || (typeof ACTIVE_PUMP !== 'undefined' ? ACTIVE_PUMP : 'p1');
+      var _fsSnapTs  = (window.__PB_FS_SNAP_TS && window.__PB_FS_SNAP_TS[_auditPump]) || '(not captured)';
+      var _lsSnapKey = _auditPump==='p1' ? 'pb-snap-v1' : 'pb-snap-v1__'+_auditPump;
+      var _lsSnapTs  = (function(){ try{ var r=localStorage.getItem(_lsSnapKey); return r?(JSON.parse(r)._syncedAt||'(none)'):'(absent)'; }catch(_e){return '(error)';} })();
+      var _qDepth    = (typeof PB_FirestoreWriter !== 'undefined') ? PB_FirestoreWriter.getQueueDepth() : {pending:0,dead:0,total:0};
+      var _smPending = (typeof QueueManager !== 'undefined') ? QueueManager.pendingCount() : 0;
+      console.group('===== DATA AUDIT =====');
+      console.log('Pump:                       ' + _auditPump);
+      console.log('Firestore Snapshot Updated: ' + _fsSnapTs);
+      console.log('Local Snapshot Updated:     ' + _lsSnapTs);
+      console.log('Queue Pending (QueueMgr):   ' + _smPending);
+      console.log('Queue Pending (FW):         ' + _qDepth.pending);
+      console.log('Queue Dead:                 ' + _qDepth.dead);
+      console.log('Last Firestore Write:       ' + (window.__PB_LAST_FS_WRITE || '(none this session)'));
+      console.log('Last Firestore Read:        ' + (window.__PB_LAST_FS_READ  || '(none this session)'));
+      console.log('Source Of Truth:            ' + (window.__PB_SOURCE || 'UNKNOWN'));
+      console.groupEnd();
+    } catch(_auditErr) { console.warn('[DATA AUDIT] report error:', _auditErr.message||_auditErr); }
   });
 }
 
@@ -29311,6 +29509,128 @@ function _pbRestoreLegacyPath(fbUser, claims, email, knownCid, fsDb, btn){
   if(btn){btn.disabled=false;btn.classList.remove('loading');}
   showAuthErr('login-err','[V5] Legacy restore path removed. Please contact support. (uid='+fbUser.uid+')');
 }
+
+
+// ── FORENSIC AUDIT ────────────────────────────────────────────────────────────
+// Read-only: no writes, no queue changes, no UI changes.
+// Run from browser console: window.pbDataForensics()  or  window.pbDataForensics('p2')
+// Compares every localStorage value vs the live Firestore document side-by-side.
+// Goal: pinpoint the exact document where Device A and Firestore diverge.
+async function _pbDataForensicsAsync(pumps, fsDb, base) {
+  var now      = new Date();
+  var todayKey = now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-'+String(now.getDate()).padStart(2,'0');
+
+  // localStorage helpers (key varies: p1 uses base key, pN uses base__pN)
+  function _lsGet(baseKey, pid) {
+    try { return JSON.parse(localStorage.getItem(pid==='p1' ? baseKey : baseKey+'__'+pid) || 'null'); }
+    catch(e) { return null; }
+  }
+  // Firestore read helper — returns {data, exists, error}
+  async function _fsGet(ref) {
+    try { var d=await ref.get(); return {exists:d.exists, data:d.exists?d.data():null, error:null}; }
+    catch(e) { return {exists:false, data:null, error:e.message||String(e)}; }
+  }
+
+  for (var i = 0; i < pumps.length; i++) {
+    var pump = pumps[i];
+    var pid  = typeof pump === 'string' ? pump : pump.id;
+    if (!pid) continue;
+    var pBase = base + '/pumps/' + pid;
+
+    console.group('===== FORENSIC REPORT =====');
+    console.log('Pump: ' + pid);
+    console.log('---');
+
+    // ── SNAPSHOT ──────────────────────────────────────────────────────────────
+    var ls_snap = _lsGet('pb-snap-v1', pid);
+    var fs_snap = await _fsGet(fsDb.doc(pBase+'/data/snapshot'));
+    var snap_match = !!(ls_snap && fs_snap.exists && !fs_snap.error &&
+      JSON.stringify({cash:ls_snap.cash, bank:ls_snap.bank, sale:ls_snap.sale}) ===
+      JSON.stringify({cash:fs_snap.data.cash, bank:fs_snap.data.bank, sale:fs_snap.data.sale}));
+    console.log('LOCAL SNAPSHOT:     cash='+(ls_snap?ls_snap.cash:'—')+
+      '  bank='+(ls_snap?ls_snap.bank:'—')+
+      '  sale='+(ls_snap?ls_snap.sale:'—')+
+      '  _syncedAt='+(ls_snap?ls_snap._syncedAt:'(absent)'));
+    console.log('FIRESTORE SNAPSHOT: cash='+(fs_snap.data?fs_snap.data.cash:'—')+
+      '  bank='+(fs_snap.data?fs_snap.data.bank:'—')+
+      '  sale='+(fs_snap.data?fs_snap.data.sale:'—')+
+      '  _syncedAt='+(fs_snap.data?fs_snap.data._syncedAt:'—')+
+      (!fs_snap.exists?' ← DOC MISSING':'')+
+      (fs_snap.error?' ← READ ERROR: '+fs_snap.error:''));
+    console.log('MATCH: ' + (fs_snap.error ? 'UNKNOWN (read error)' : snap_match ? 'YES ✓' : 'NO ✗  ← MISMATCH'));
+    console.log('---');
+
+    // ── SESSION (today's record) ───────────────────────────────────────────────
+    var ls_rec = _lsGet('pb-session-v1', pid);
+    var fs_rec = await _fsGet(fsDb.doc(pBase+'/records/'+todayKey));
+    var rec_keys = (ls_rec && fs_rec.data)
+      ? Object.keys(ls_rec).filter(function(k){return k!=='_syncedAt'&&k!=='_v';})
+      : [];
+    var rec_match = !!(ls_rec && fs_rec.exists && !fs_rec.error && rec_keys.every(function(k){
+      return JSON.stringify(ls_rec[k]) === JSON.stringify(fs_rec.data[k]);
+    }));
+    console.log('LOCAL SESSION:     '+(ls_rec?JSON.stringify(ls_rec).slice(0,250):'(absent)'));
+    console.log('FIRESTORE SESSION: '+(fs_rec.error?'READ ERROR: '+fs_rec.error:
+      fs_rec.data?JSON.stringify(fs_rec.data).slice(0,250):'(DOC MISSING — fresh day or no entry yet)'));
+    console.log('MATCH: '+(fs_rec.error?'UNKNOWN':(ls_rec&&fs_rec.exists?rec_match?'YES ✓':'NO ✗  ← MISMATCH':'N/A')));
+    console.log('---');
+
+    // ── CONFIG ────────────────────────────────────────────────────────────────
+    var ls_cfg = _lsGet('pump_settings_v1', pid);
+    var fs_cfg = await _fsGet(fsDb.doc(pBase+'/data/config'));
+    var cfg_match = !!(ls_cfg && fs_cfg.exists && !fs_cfg.error &&
+      ls_cfg._syncedAt === fs_cfg.data._syncedAt);
+    console.log('LOCAL CONFIG:     _syncedAt='+(ls_cfg?ls_cfg._syncedAt:'(absent)'));
+    console.log('FIRESTORE CONFIG: _syncedAt='+(fs_cfg.data?fs_cfg.data._syncedAt:'—')+
+      (!fs_cfg.exists?' ← DOC MISSING':'')+
+      (fs_cfg.error?' ← READ ERROR: '+fs_cfg.error:''));
+    console.log('MATCH: '+(fs_cfg.error?'UNKNOWN':cfg_match?'YES ✓':'NO ✗  ← MISMATCH'));
+    console.log('---');
+
+    // ── HISTORY (document count comparison) ───────────────────────────────────
+    var ls_hist       = _lsGet('pump_history_v1', pid);
+    var ls_hist_count = ls_hist ? Object.keys(ls_hist).length : 0;
+    var fs_hist_count = -1;
+    try { var _hs = await fsDb.collection(pBase+'/history').get(); fs_hist_count = _hs.size; }
+    catch(e) { fs_hist_count = -1; }
+    console.log('LOCAL HISTORY:     '+ls_hist_count+' date entries in localStorage');
+    console.log('FIRESTORE HISTORY: '+(fs_hist_count<0?'(READ ERROR)':fs_hist_count+' documents in collection'));
+    console.log('MATCH: '+(fs_hist_count<0?'UNKNOWN':(ls_hist_count===fs_hist_count?'YES ✓':'COUNT DIFFERS: local='+ls_hist_count+' firestore='+fs_hist_count)));
+    console.log('---');
+
+    // ── QUEUE STATE ───────────────────────────────────────────────────────────
+    var sm_all     = (typeof QueueManager!=='undefined') ? QueueManager.getAllOperations()  : [];
+    var sm_pending = sm_all.filter(function(o){return o.status==='pending'&&(o.pumpId===pid||(!o.pumpId&&pid==='p1'));}).length;
+    var sm_failed  = sm_all.filter(function(o){return o.status==='failed' &&(o.pumpId===pid||(!o.pumpId&&pid==='p1'));}).length;
+    var fw_d       = (typeof PB_FirestoreWriter!=='undefined') ? PB_FirestoreWriter.getQueueDepth() : {total:0,pending:0,dead:0};
+    console.log('QUEUE MANAGER:    pending='+sm_pending+' failed='+sm_failed);
+    console.log('FIRESTORE WRITER: queue='+fw_d.total+' pending='+fw_d.pending+' dead='+fw_d.dead);
+    console.log('===========================');
+    console.groupEnd();
+  }
+}
+
+window.pbDataForensics = function(pumpIdArg) {
+  var fsDb;
+  try { fsDb = firebase.firestore(); } catch(e) {
+    console.error('[FORENSICS] firebase.firestore() unavailable — are you logged in?'); return;
+  }
+  var aid = (typeof PB_FirestoreWriter !== 'undefined') ? PB_FirestoreWriter.getAccountId() : null;
+  if (!aid) { console.error('[FORENSICS] No accountId — PB_FirestoreWriter not ready. Log in first.'); return; }
+  var prefix = (typeof PB_FIRESTORE_PATHS !== 'undefined') ? PB_FIRESTORE_PATHS.getPrefix() : 'companies';
+  var base   = prefix + '/' + aid;
+  var pumps;
+  if (pumpIdArg) {
+    pumps = [pumpIdArg];
+  } else {
+    var _pumps = (typeof StorageService !== 'undefined') ? StorageService.loadPumps() : null;
+    pumps = (_pumps && _pumps.length) ? _pumps : [(typeof ACTIVE_PUMP !== 'undefined' ? ACTIVE_PUMP : 'p1')];
+  }
+  console.log('[FORENSICS] Starting. account='+aid+' base='+base+' pumps='+JSON.stringify(pumps.map(function(p){return typeof p==='string'?p:p.id;})));
+  _pbDataForensicsAsync(pumps, fsDb, base).catch(function(e) {
+    console.error('[FORENSICS] Fatal error:', e.message||e);
+  });
+};
 
 
 // ── Session helpers ───────────────────────────────────────────────────────────
@@ -39782,865 +40102,4 @@ function _pbInitStorage(){
                     PB_FirestoreWriter.flush().catch(function(){});
                     if(typeof PB_QueueReplayEngine !== 'undefined'){
                       PB_QueueReplayEngine.replayAll(PB_FirestoreWriter).catch(function(){});
-                    }
-                  }
-                }).catch(function(profileErr){
-                  // userProfile read failed — fall back to JWT claims
-                  var aid = claims.accountId || fbUser.uid;
-                  console.warn('[PetroBook] userProfile read failed, using claims.accountId:', profileErr.message||profileErr);
-                  if(PB_FirestoreWriter.init(fsDb, aid)){
-                    PB_FirestoreWriter.flush().catch(function(){});
-                  }
-                });
-              }).catch(function(e){
-                // No custom claims — use Firebase UID directly
-                PB_FirestoreWriter.init(fsDb, fbUser.uid);
-                console.warn('[PetroBook] Auth claims unavailable, using fbUser.uid as accountId:', e);
-                PB_FirestoreWriter.flush().catch(function(){});
-              });
-            });
-          }
-          // 5. Wire online reconnect handler to flush queued offline writes
-          window.addEventListener('online', function(){
-            if(typeof SyncEngine !== 'undefined' && SyncEngine.ACTIVE){
-              SyncEngine.replayQueue();
-            }
-          }, { passive: true, once: false });
-          console.info('[PetroBook] Firebase sync resumed from persistent flag.');
-        }catch(e){ console.warn('[PetroBook] Sync restore failed:', e); }
-      }
-    }
-  }catch(e){ console.warn('[PetroBook] Firebase startup failed — using localStorage:', e.message||e); }
-}
-
-(function boot(){
-  try{
-    _pbInitStorage();
-    if(GCFG.pinLock&&GCFG.pin)showPinLock();
-  }catch(e){
-    console.error('[PetroBook Boot]', e.message||e);
-  }
-})();
-
-// ── ROLE ROUTING — runs after all init/paint handlers ──
-window.addEventListener('load', function(){
-  setTimeout(function(){
-    try{ getPumps(); }catch(e){}
-
-    // ── Step 1: Check session expiry ──────────────────────────────────────
-    // Phase 3C: Future async version of this router:
-    //   const ctx = await _pbAuthReady();
-    //   if(_isSessionExpiredFrom(ctx)) { ... }
-    // For now: sync reads are used directly.
-    if(typeof _isSessionExpired === 'function' && _isSessionExpired()){
-      console.info('[PetroBook] SETUP_TRIGGER_REASON=session_expired');
-      try{ _clearSession(); }catch(e){}
-      try{ showRoleLogin(); }catch(e){ console.error('[PetroBook login]',e); }
-      return;
-    }
-
-    // ── Step 2: Get role from stored session ──────────────────────────────
-    const role = getRole();
-
-    // ── Step 3: No session at all → show login ────────────────────────────
-    if(!role){
-      console.info('[PetroBook] SETUP_TRIGGER_REASON=no_role_in_localstorage — new device or cleared storage');
-      try{ showRoleLogin(); }catch(e){ console.error('[PetroBook login]',e); }
-      return;
-    }
-
-    // ── Step 4: Valid session exists — check if PIN is required ───────────
-    // A returning user with a PIN must enter it even if their session hasn't
-    // technically expired. PIN is required on every fresh app open.
-    try{
-      const sess = (typeof _getSession === 'function') ? _getSession() : null;
-      const userId = sess ? sess.userId : null;
-      const pinHash = userId && (typeof _loadPinHash === 'function') ? _loadPinHash(userId) : null;
-
-      if(pinHash && userId){
-        // User has a PIN set — show PIN screen instead of entering app silently
-        const user = (typeof _getUserById === 'function') ? _getUserById(userId) : null;
-        if(user && user.status !== 'inactive'){
-          _pinUserId = userId;
-          if(typeof _showPinScreen === 'function') _showPinScreen(user);
-          if(typeof showRoleLogin === 'function'){
-            const loginEl = document.getElementById('pb-login');
-            if(loginEl) loginEl.classList.add('open');
-          }
-          if(typeof _authWaveInit === 'function') _authWaveInit();
-          return;
-        }
-      }
-    }catch(e){ console.error('[PetroBook PIN check]', e); }
-
-    // ── Step 5: Valid session, no PIN set → enter app directly ────────────
-    if(role === 'manager'){
-      try{ enterManagerMode(getManagerPump()); }
-      catch(e){ console.error('[PetroBook enterManager]', e); }
-    } else {
-      try{ enterOwnerMode(); }
-      catch(e){ console.error('[PetroBook enterOwner]', e); }
-    }
-  }, 120);
-});
-
-
-
-// ══════════════════════════════════════════════════════════
-// ICON RENDERER — inline SVG from data-lucide attributes
-// ══════════════════════════════════════════════════════════
-// ── SELF-CONTAINED ICON ENGINE (no CDN) ──────────────────────────────────────
-// All 38 icons used in this app, inlined as SVG path data.
-const _IC = {
-  'fuel':           ['M3 3h12l1 3H3z','M3 6h13l2 6H2z','M3 12h14v8a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z','M8 14v5','M5 15v4','M15 15v4','M6 3V1h2v2z','M14 3V1h2v2z'],
-  'banknote':       ['M2 7a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2z','M12 12m-2 0a2 2 0 1 0 4 0 2 2 0 0 0-4 0','M6 10h.01','M18 10h.01'],
-  'landmark':       ['M3 22V12','M21 22V12','M12 22V12','M12 2 2 7h20z','M5 12h14'],
-  'credit-card':    ['M2 7a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2z','M2 11h20','M7 16h2','M11 16h2'],
-  'gauge':          ['M12 12m-1 0a1 1 0 1 0 2 0 1 1 0 0 0-2 0','M12 2a10 10 0 1 0 0 20A10 10 0 0 0 12 2z','M12 12L9 9'],
-  'package':        ['M16.5 9.4 7.55 4.24','M3 6l9 5.25L21 6','M12 22V11.25','M21 6v12a2 2 0 0 1-1 1.73l-8 4a2 2 0 0 1-2 0l-8-4A2 2 0 0 1 3 18V6l8-4a2 2 0 0 1 2 0z'],
-  'receipt':        ['M4 2h16a1 1 0 0 1 1 1v18l-3-2-2 2-2-2-2 2-2-2-3 2V3a1 1 0 0 1 1-1z','M8 8h8','M8 12h8','M8 16h5'],
-  'history':        ['M3 3v5h5','M3.05 13A9 9 0 1 0 6 5.3L3 8','M12 7v5l4 2'],
-  'settings':       ['M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z','M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z'],
-  'home':           ['M3 12 12 3l9 9','M5 10v9a1 1 0 0 0 1 1h4v-4h4v4h4a1 1 0 0 0 1-1v-9'],
-  'save':           ['M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z','M17 21v-8H7v8','M7 3v5h8'],
-  'layers':         ['M12 2 2 7l10 5 10-5-10-5z','M2 17l10 5 10-5','M2 12l10 5 10-5'],
-  'users':          ['M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2','M9 11m-4 0a4 4 0 1 0 8 0 4 4 0 0 0-8 0','M22 21v-2a4 4 0 0 0-3-3.87','M16 3.13a4 4 0 0 1 0 7.75'],
-  'user':           ['M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2','M12 7m-4 0a4 4 0 1 0 8 0 4 4 0 0 0-8 0'],
-  'log-out':        ['M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4','M16 17l5-5-5-5','M21 12H9'],
-  'moon':           ['M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z'],
-  'sun':            ['M12 12m-4 0a4 4 0 1 0 8 0 4 4 0 0 0-8 0','M12 2v2','M12 20v2','M4.22 4.22l1.42 1.42','M18.36 18.36l1.42 1.42','M2 12h2','M20 12h2','M4.22 19.78l1.42-1.42','M18.36 5.64l1.42-1.42'],
-  'sun-moon':       ['M12 8a4 4 0 1 1-4 4','M12 2v2','M12 8V4','M20 8.5A8.5 8.5 0 1 1 6.5 20'],
-  'chevron-right':  ['M9 18l6-6-6-6'],
-  'chevron-left':   ['M15 18l-6-6 6-6'],
-  'trending-up':    ['M23 6l-9.5 9.5-5-5L1 18','M17 6h6v6'],
-  'check':          ['M20 6 9 17l-5-5'],
-  'check-circle':   ['M22 11.08V12a10 10 0 1 1-5.93-9.14','M22 4 12 14.01l-3-3'],
-  'x':              ['M18 6 6 18','M6 6l12 12'],
-  'plus':           ['M12 5v14','M5 12h14'],
-  'lock':           ['M19 11H5a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7a2 2 0 0 0-2-2z','M7 11V7a5 5 0 0 1 10 0v4'],
-  'unlock':         ['M19 11H5a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7a2 2 0 0 0-2-2z','M7 11V7a5 5 0 0 1 9.9-1'],
-  'key':            ['M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3m-3.5 3.5L19 4'],
-  'pencil':         ['M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z'],
-  'share-2':        ['M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8','M16 6l-4-4-4 4','M12 2v13'],
-  'message-circle': ['M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8z'],
-  'copy':           ['M20 9h-9a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2v-9a2 2 0 0 0-2-2z','M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1'],
-  'download':       ['M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4','M7 10l5 5 5-5','M12 15V3'],
-  'database':       ['M12 2C8.13 2 5 3.34 5 5v14c0 1.66 3.13 3 7 3s7-1.34 7-3V5c0-1.66-3.13-3-7-3z','M5 5c0 1.66 3.13 3 7 3s7-1.34 7-3','M5 12c0 1.66 3.13 3 7 3s7-1.34 7-3'],
-  'rotate-ccw':     ['M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8','M3 3v5h5'],
-  'arrow-right-left':['M17 3l4 4-4 4','M3 7h18','M7 21l-4-4 4-4','M21 17H3'],
-  'clipboard-list': ['M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2','M9 2h6a1 1 0 0 1 1 1v2a1 1 0 0 1-1 1H9a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1z','M9 12h6','M9 16h4'],
-  'smartphone':     ['M17 2H7a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2z','M12 18h.01'],
-  'sparkles':       ['M12 3l1.5 4.5L18 9l-4.5 1.5L12 15l-1.5-4.5L6 9l4.5-1.5z','M5 3l.75 2.25L8 6l-2.25.75L5 9l-.75-2.25L2 6l2.25-.75z','M19 15l.75 2.25L22 18l-2.25.75L19 21l-.75-2.25L16 18l2.25-.75z'],
-  'volume-2':       ['M11 5 6 9H2v6h4l5 4V5z','M19.07 4.93a10 10 0 0 1 0 14.14','M15.54 8.46a5 5 0 0 1 0 7.07'],
-  'trending-down':  ['M22 17l-8.5-8.5-5 5L2 7','M16 17h6','M22 11v6'],
-  'triangle-alert': ['M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z','M12 9v4','M12 17h.01'],
-  'hand-coins':     ['M11 15h2a2 2 0 1 0 0-4h-3c-.6 0-1.1.2-1.4.6L3 17','M3 17l3 3 7-3.5','M16 6a4 4 0 0 1 0 8'],
-  'arrow-left':     ['M19 12H5','M12 19l-7-7 7-7'],
-  'circle-check-big':['M22 11.08V12a10 10 0 1 1-5.93-9.14','M22 4 12 14.01l-3-3'],
-  'activity':       ['M22 12h-4l-3 9L9 3l-3 9H2'],
-  'layout-dashboard':['M3 3h7v7H3z','M14 3h7v7h-7z','M3 14h7v7H3z','M14 14h7v7h-7z'],
-};
-
-// Build a single SVG element for the given icon name
-function _buildSVG(name, wPx, hPx, extraStyle) {
-  const paths = _IC[name];
-  if (!paths) return null;
-  const ns = 'http://www.w3.org/2000/svg';
-  const svg = document.createElementNS(ns, 'svg');
-  svg.setAttribute('viewBox', '0 0 24 24');
-  svg.setAttribute('fill', 'none');
-  svg.setAttribute('stroke', 'currentColor');
-  svg.setAttribute('stroke-width', '2');
-  svg.setAttribute('stroke-linecap', 'round');
-  svg.setAttribute('stroke-linejoin', 'round');
-  svg.setAttribute('aria-hidden', 'true');
-  const s = 'width:' + (wPx||'1em') + ';height:' + (hPx||'1em') +
-            ';vertical-align:middle;flex-shrink:0;display:inline-block' +
-            (extraStyle ? ';' + extraStyle : '');
-  svg.setAttribute('style', s);
-  paths.forEach(function(d) {
-    const p = document.createElementNS(ns, 'path');
-    p.setAttribute('d', d);
-    svg.appendChild(p);
-  });
-  return svg;
-}
-
-// Replace every <i data-lucide="name"> inside the given roots with inline SVG
-function lIcons(opts) {
-  const roots = (opts && opts.nodes) ? (Array.isArray(opts.nodes) ? opts.nodes : [opts.nodes]) : [document.body];
-  roots.forEach(function(root) {
-    if (!root) return;
-    // querySelectorAll on an SVG node throws, skip it
-    try {
-      const els = root.querySelectorAll('i[data-lucide]');
-      els.forEach(function(el) {
-        const name = el.getAttribute('data-lucide');
-        const style = el.getAttribute('style') || '';
-        // Parse explicit px dimensions if provided
-        const wm = style.match(/width\s*:\s*([\d.]+)px/);
-        const hm = style.match(/height\s*:\s*([\d.]+)px/);
-        const w = wm ? wm[1] + 'px' : '1em';
-        const h = hm ? hm[1] + 'px' : '1em';
-        // Preserve opacity / color etc. (strip dimension rules)
-        const extra = style
-          .replace(/width\s*:[^;]+;?/g, '')
-          .replace(/height\s*:[^;]+;?/g, '')
-          .replace(/;\s*$/, '').trim();
-        const svg = _buildSVG(name, w, h, extra);
-        if (svg && el.parentNode) el.parentNode.replaceChild(svg, el);
-      });
-    } catch(e) {}
-  });
-}
-
-// Initial paint — handled by DOMContentLoaded in the main script block above.
-// lIcons and refreshDashboard are all called there, after
-// all state variables (stockData, readings, CFG etc.) are fully initialised.
-
-// ═══════════════════════════════════════════════════
-// PREMIUM UI ENHANCEMENTS — Al-Manar Station v1.0
-// Smart insights · Status chip · Enhanced toast
-// ═══════════════════════════════════════════════════
-
-// ── Dropdown / select validation helpers ──────────────────────────────────────
-/**
- * markSelError(el) — adds .sel-error class, removes it on next change
- */
-window.markSelError = function(el) {
-  if (!el) return;
-  el.classList.add('sel-error');
-  var _remove = function() {
-    el.classList.remove('sel-error');
-    el.removeEventListener('change', _remove);
-    el.removeEventListener('input', _remove);
-    el.removeEventListener('focus', _remove);
-  };
-  el.addEventListener('change', _remove);
-  el.addEventListener('input', _remove);
-  el.addEventListener('focus', _remove);
-};
-
-/**
- * validateSelects(containerEl) — marks all empty required selects in a container.
- * Returns true if all pass, false if any fail.
- */
-window.validateSelects = function(containerEl) {
-  var selects = (containerEl || document).querySelectorAll('select[required], .pb-sel[required]');
-  var valid = true;
-  selects.forEach(function(s) {
-    if (!s.value || s.value === '') {
-      window.markSelError(s);
-      valid = false;
-    }
-  });
-  return valid;
-};
-
-// ── Mobile Safari — prevent sheet from jumping when native select opens ──────
-(function() {
-  document.addEventListener('focusin', function(e) {
-    if (e.target && e.target.tagName === 'SELECT') {
-      var sheet = e.target.closest('.sheet, .ovl, [class*="sheet"]');
-      if (sheet) {
-        var savedScrollTop = sheet.scrollTop;
-        requestAnimationFrame(function() {
-          if (sheet.scrollTop !== savedScrollTop) {
-            sheet.scrollTop = savedScrollTop;
-          }
-        });
-      }
-    }
-  }, true);
-})();
-
-// ── Smart Insights Engine ────────────────────────────────────────────────────
-function refreshInsights() {
-  const bar = document.getElementById('insight-bar');
-  if (!bar) return;
-  const chips = [];
-  const hist = StorageService.loadFuelHistory();
-  const today = _localDateStr();
-  const _yd=new Date();_yd.setDate(_yd.getDate()-1);
-  const yesterday = _localDateStr(_yd);
-  const yestRec = hist.find(r => r.date === yesterday);
-
-  // Trend vs yesterday
-  if (yestRec) {
-    const todaySale = (typeof getTotalSale === 'function') ? getTotalSale() : 0;
-    const yestSale  = yestRec.totalSale || 0;
-    if (yestSale > 0 && todaySale > 0) {
-      const pct = ((todaySale - yestSale) / yestSale * 100).toFixed(0);
-      const up  = pct >= 0;
-      chips.push({
-        dot: up ? '#10b981' : '#ef4444',
-        label: 'vs Yesterday',
-        val: (up ? '+' : '') + pct + '%',
-        color: up ? '#059669' : '#dc2626',
-      });
-    }
-  }
-
-  // Low stock alert
-  if (typeof stockData !== 'undefined' && typeof CFG !== 'undefined') {
-    ['g','r','d'].forEach(function(f) {
-      const stk = stockData[f] || {};
-      const closing = parseFloat(stk.closing) || 0;
-      const cap = parseInt((CFG.openStock || {})[f] || 0) || 0;
-      if (closing > 0 && closing < (CFG.lowStock || 5000)) {
-        const fName = f === 'g' ? '91' : f === 'r' ? '95' : 'DSL';
-        chips.push({ dot: '#f59e0b', label: fName + ' Low Stock', val: closing + ' L', color: '#d97706' });
-      }
-    });
-  }
-
-  // Expense ratio
-  if (typeof getTotalSale === 'function' && typeof getTotalExp === 'function') {
-    try {
-      const sale = getTotalSale();
-      const exp  = getTotalExp();
-      if (sale > 0 && exp > 0) {
-        const ratio = (exp / sale * 100).toFixed(0);
-        chips.push({ dot: '#f97316', label: PB18n.t('misc.expense_ratio'), val: ratio + '%', color: '#ea580c' });
-      }
-    } catch(e) {}
-  }
-
-  if (!chips.length) { bar.style.display = 'none'; return; }
-  bar.style.display = 'flex';
-  bar.innerHTML = chips.map(function(c) {
-    return '<div class="insight-chip">' +
-      '<span class="insight-chip-dot" style="background:' + c.dot + '"></span>' +
-      c.label +
-      '<span class="insight-chip-val" style="color:' + c.color + '">' + c.val + '</span>' +
-      '</div>';
-  }).join('');
-}
-
-// ── Status Chip ──────────────────────────────────────────────────────────────
-function refreshStatusChip() {
-  const chip  = document.getElementById('hdr-status-chip');
-  const label = document.getElementById('hdr-status-text');
-  if (!chip || !label) return;
-  const today = _localDateStr();
-  const hist  = StorageService.loadFuelHistory();
-  const committed = hist.some(function(r) { return r.date === today; });
-  if (committed) {
-    chip.style.background  = 'rgba(79,70,229,.10)';
-    chip.style.borderColor = 'rgba(79,70,229,.22)';
-    chip.style.color       = '#4f46e5';
-    chip.querySelector('.hdr-status-dot').style.background = '#4f46e5';
-    label.textContent = PB18n.t('misc.synced');
-  } else {
-    chip.style.background  = 'rgba(16,185,129,.09)';
-    chip.style.borderColor = 'rgba(16,185,129,.22)';
-    chip.style.color       = '#059669';
-    chip.querySelector('.hdr-status-dot').style.background = '#22c55e';
-    label.textContent = PB18n.t('hdr.status.open');
-  }
-}
-
-// ── Post-dashboard-refresh hook ───────────────────────────────────────────────
-const _origRefreshDash = window.refreshDashboard;
-if (typeof _origRefreshDash === 'function') {
-  window.refreshDashboard = function() {
-    _origRefreshDash.apply(this, arguments);
-    try { refreshStatusChip(); } catch(e) {}
-    try { refreshInsights();   } catch(e) {}
-    try { if(typeof writeSnapshot==='function') writeSnapshot(); } catch(e) {}
-  };
-}
-
-// Initial calls on load
-document.addEventListener('DOMContentLoaded', function() {
-  setTimeout(function() {
-    try { refreshStatusChip(); } catch(e) {}
-    try { refreshInsights();   } catch(e) {}
-  }, 700);
-});
-
-
-/* ══════════════════════════════════════════════════════════════════════════════
-   DAILY ENTRY ENHANCEMENTS — simple, fast, operational
-   • Auto carry-forward (nozzle closings + stock → next day openings)
-   • Lightweight auto-save (session, debounced 2 s)
-   • Save summary popup (compact before save)
-   • Simple nozzle validation (closing < opening)
-   ══════════════════════════════════════════════════════════════════════════════ */
-
-/* ── Auto-save debounce ─────────────────────────────────────────────────── */
-var _autoSaveT = null;
-function _triggerAutoSave() {
-  clearTimeout(_autoSaveT);
-  _autoSaveT = setTimeout(function () {
-    try { if (typeof saveSession === 'function') saveSession(); } catch(e) {}
-  }, 2000);
-}
-
-/* ── Record page date bar ─────────────────────────────────────────────── */
-function refreshRecordBar() {
-  try {
-    var today = new Date();
-    var ds = document.getElementById('rec-date-str');
-    if (ds) ds.textContent = today.toLocaleDateString('en-GB',
-      {weekday:'short', day:'numeric', month:'short', year:'numeric'});
-
-    // Progress: count completed fuel readings + stocks (max 6)
-    var done = 0;
-    ['g','r','d'].forEach(function(f) {
-      var hr = false;
-      try { for (var n=1;n<=4;n++) { if ((readings[f][n].liters||0)>0){hr=true;break;} } } catch(e){}
-      if (hr) done++;
-      try { if (stockData[f].open != null) done++; } catch(e) {}
-    });
-    var pg = document.getElementById('rec-date-prog');
-    if (pg) pg.textContent = done + '/6';
-  } catch(e) {}
-}
-
-/* ── Carry-forward display ────────────────────────────────────────────── */
-function refreshCarryBanner() {
-  try {
-    var banner = document.getElementById('rec-cf-banner');
-    var cfDate = (typeof _cfBannerDate !== 'undefined') ? _cfBannerDate : null;
-    if (!banner || !cfDate) { if (banner) banner.style.display = 'none'; return; }
-
-    var hist = (typeof loadHistory === 'function') ? loadHistory() : {};
-    var yRec = hist[cfDate];
-    if (!yRec) { banner.style.display = 'none'; return; }
-
-    banner.style.display = '';
-    var cl = yRec.closings || {};
-    var parts = [];
-    var FNAME = { g:'91', r:'95', d:'DSL' };
-    ['g','r','d'].forEach(function(f) {
-      var maxM = null;
-      for (var n=1;n<=4;n++) { var v=cl.meter?.[f]?.[n]; if(v!=null&&(maxM===null||v>maxM)) maxM=v; }
-      if (maxM !== null) parts.push(FNAME[f]+' meter: '+maxM.toLocaleString());
-      var sv = cl.stock?.[f];
-      if (sv != null) parts.push(FNAME[f]+' stock: '+Math.round(sv).toLocaleString()+' L');
-    });
-    var val = document.getElementById('rec-cf-val');
-    if (val) val.textContent = parts.slice(0,4).join(' · ');
-  } catch(e) {}
-}
-
-/* ── Lightweight nozzle validation ───────────────────────────────────── */
-function _quickValidate() {
-  var errs = [];
-  var FNAME = { get g(){return PB18n.t('fuel.91')}, get r(){return PB18n.t('fuel.95')}, get d(){return PB18n.t('fuel.dsl')} };
-  ['g','r','d'].forEach(function(f) {
-    for (var n=1;n<=4;n++) {
-      try {
-        var r = readings[f][n];
-        if (r.open != null && r.close != null && r.close < r.open) {
-          errs.push(FNAME[f]+' Nozzle '+n+': closing ('+r.close+') < opening ('+r.open+')');
-        }
-      } catch(e) {}
-    }
-  });
-  return errs;
-}
-
-/* ── Save summary popup ───────────────────────────────────────────────── */
-function openSaveSummary() {
-  try {
-    var today = new Date();
-    var dateStr = today.toLocaleDateString('en-GB',
-      {weekday:'long', day:'numeric', month:'long', year:'numeric'});
-    var el = document.getElementById('ss-date');
-    if (el) el.textContent = dateStr;
-    var title = document.getElementById('ss-title');
-    if (title) title.textContent = PB18n.t('rec.save_report');
-
-    var tA   = (typeof getTotalSale === 'function') ? getTotalSale() : 0;
-    var card = (typeof getTotalCard === 'function') ? getTotalCard() : 0;
-    var exp  = (typeof getTotalExp  === 'function') ? getTotalExp()  : 0;
-    var cih  = tA - card - exp;
-    var FNAME = { get g(){return PB18n.t('fuel.91')}, get r(){return PB18n.t('fuel.95')}, get d(){return PB18n.t('fuel.dsl')} };
-    var fmt  = function(n) { return sar(n); };
-
-    // Validation warnings
-    var errs = _quickValidate();
-    var warnEl = document.getElementById('ss-warnings');
-    if (warnEl) {
-      warnEl.innerHTML = errs.map(function(e) {
-        return '<div class="ss-warn-item">⚠️ ' + e + '</div>';
-      }).join('');
-    }
-
-    // Fuel rows
-    var fuelEl = document.getElementById('ss-fuel-rows');
-    if (fuelEl) {
-      var html = '';
-      ['g','r','d'].forEach(function(f) {
-        var L = 0, S = 0;
-        try { for (var n=1;n<=4;n++){L+=(readings[f][n].liters||0);S+=(readings[f][n].total||0);} } catch(e){}
-        if (L > 0) {
-          html += '<div class="ss-row">'
-               + '<span class="ss-row-name">' + FNAME[f] + '</span>'
-               + '<span class="ss-row-val">' + Math.round(L).toLocaleString() + ' L &nbsp;·&nbsp; ' + fmt(S) + '</span>'
-               + '</div>';
-        }
-      });
-      fuelEl.innerHTML = html || '<div class="ss-row"><span class="ss-row-name" style="color:#94a3b8">'+PB18n.t('misc.no_readings_yet')+'</span></div>';
-    }
-
-    // Financial rows
-    var finEl = document.getElementById('ss-fin-rows');
-    if (finEl) {
-      var cashConf = (typeof totalCashConfirmed !== 'undefined' && totalCashConfirmed != null) ? totalCashConfirmed : null;
-      var bankConf = (typeof totalBankConfirmed !== 'undefined' && totalBankConfirmed != null) ? totalBankConfirmed : null;
-      finEl.innerHTML =
-        '<div class="ss-row"><span class="ss-row-name">'+PB18n.t('rec.total_sale')+'</span><span class="ss-row-val pos">' + fmt(tA) + '</span></div>'
-      + (card > 0 ? '<div class="ss-row"><span class="ss-row-name">Card / Bank</span><span class="ss-row-val">' + fmt(card) + '</span></div>' : '')
-      + (exp  > 0 ? '<div class="ss-row"><span class="ss-row-name">Expenses</span><span class="ss-row-val neg">−' + fmt(exp) + '</span></div>' : '')
-      + '<div class="ss-row"><span class="ss-row-name">Cash in Hand</span><span class="ss-row-val ' + (cih>=0?'pos':'neg') + '">' + fmt(cih) + '</span></div>'
-      + (cashConf !== null ? '<div class="ss-row"><span class="ss-row-name">Total Cash</span><span class="ss-row-val pos">' + fmt(cashConf) + '</span></div>' : '')
-      + (bankConf !== null ? '<div class="ss-row"><span class="ss-row-name">Total Bank</span><span class="ss-row-val pos">' + fmt(bankConf) + '</span></div>' : '');
-    }
-
-    // Grand total
-    var sg = (typeof getStockValue === 'function') ? (getStockValue('g')||0) : 0;
-    var sr = (typeof getStockValue === 'function') ? (getStockValue('r')||0) : 0;
-    var sd = (typeof getStockValue === 'function') ? (getStockValue('d')||0) : 0;
-    var grand = sg + sr + sd + (typeof totalCashConfirmed!=='undefined'&&totalCashConfirmed!=null?totalCashConfirmed:0)
-                             + (typeof totalBankConfirmed!=='undefined'&&totalBankConfirmed!=null?totalBankConfirmed:0);
-    var grandEl = document.getElementById('ss-grand');
-    if (grandEl) {
-      grandEl.innerHTML = grand > 0
-        ? '<div class="ss-grand"><span class="ss-grand-lbl">GRAND TOTAL</span><span class="ss-grand-val">' + sar(grand) + '</span></div>'
-        : '';
-    }
-
-    document.getElementById('ov-save-summary').classList.add('open');
-    if (typeof vibe === 'function') vibe(8);
-  } catch(e) {
-    console.warn('[openSaveSummary]', e);
-    // Fallback: save directly if popup fails
-    if (typeof doSave === 'function') doSave();
-  }
-}
-
-function closeSaveSummary() {
-  var el = document.getElementById('ov-save-summary');
-  if (el) el.classList.remove('open');
-}
-
-function doSaveConfirmed() {
-  closeSaveSummary();
-  if (typeof doSave === 'function') doSave();
-  // After save, show next-day ready prompt
-  setTimeout(function () {
-    try { _showNextDayPrompt(); } catch(e) {}
-  }, 600);
-  refreshRecordBar();
-}
-
-/* ── Next-day prompt ─────────────────────────────────────────────────── */
-function _showNextDayPrompt() {
-  // Build carry-forward chips from today's closings
-  try {
-    var hist = (typeof loadHistory === 'function') ? loadHistory() : {};
-    var key  = (typeof getTodayKey === 'function') ? getTodayKey() : new Date().toISOString().slice(0,10);
-    var rec  = hist[key];
-    var chips = [];
-    var FNAME = { g:'91', r:'95', d:'DSL' };
-    if (rec && rec.closings) {
-      var cl = rec.closings;
-      ['g','r','d'].forEach(function(f) {
-        // Max nozzle closing
-        var maxM = null;
-        for (var n=1;n<=4;n++) { var v=cl.meter?.[f]?.[n]; if(v!=null&&(maxM===null||v>maxM)) maxM=v; }
-        if (maxM != null) chips.push(FNAME[f]+' meter: '+maxM.toLocaleString());
-        if (cl.stock?.[f] != null) chips.push(FNAME[f]+' stock: '+Math.round(cl.stock[f]).toLocaleString()+' L');
-      });
-    }
-    var carries = document.getElementById('nd-carries');
-    if (carries) {
-      carries.innerHTML = chips.slice(0,6).map(function(c) {
-        return '<span class="nd-chip">'+c+'</span>';
-      }).join('');
-    }
-    var sub = document.getElementById('nd-sub');
-    if (sub) sub.textContent = chips.length
-      ? 'Opening values for tomorrow have been prepared.'
-      : 'Today\'s report is saved.';
-  } catch(e) {}
-
-  var el = document.getElementById('ov-next-day');
-  if (el) el.classList.add('open');
-  if (typeof vibe === 'function') vibe([10,8,15]);
-}
-
-function closeNextDay() {
-  var el = document.getElementById('ov-next-day');
-  if (el) el.classList.remove('open');
-}
-
-/**
- * Clears today's session and applies today's closings as tomorrow's openings.
- * Called when user taps "Start Tomorrow's Entry".
- */
-function startTomorrow() {
-  closeNextDay();
-  try {
-    // 1. Apply today's closings to CFG as tomorrow's openings
-    var hist = (typeof loadHistory === 'function') ? loadHistory() : {};
-    var key  = (typeof getTodayKey === 'function') ? getTodayKey() : new Date().toISOString().slice(0,10);
-    var rec  = hist[key];
-    if (rec && rec.closings) {
-      var cl = rec.closings;
-      CFG.openMeter = CFG.openMeter || {};
-      ['g','r','d'].forEach(function(f) {
-        CFG.openMeter[f] = CFG.openMeter[f] || {};
-        for (var n=1;n<=4;n++) {
-          var v = cl.meter?.[f]?.[n];
-          if (v != null) CFG.openMeter[f][n] = v;
-        }
-        if (cl.stock?.[f] != null) {
-          CFG.openStock = CFG.openStock || {};
-          CFG.openStock[f] = cl.stock[f];
-        }
-      });
-      if (cl.cash != null) CFG.openCash = cl.cash;
-      if (cl.bank != null) CFG.openBank = cl.bank;
-      if (typeof persistCFG === 'function') persistCFG();
-    }
-
-    // 2. Clear all today's in-memory data
-    ['g','r','d'].forEach(function(f) {
-      for (var n=1;n<=4;n++) readings[f][n] = {};
-      stockData[f] = { open: null, add: 0, entries: [] };
-    });
-    expItems=[]; cardItems=[]; tcItems=[]; tbItems=[]; smEntries=[];
-    totalCashConfirmed=null; totalBankConfirmed=null;
-
-    // 3. Apply openings from CFG so nozzle opening fields are pre-filled
-    if (typeof applyOpeningsFromCFG === 'function') {
-      // Temporarily clear the banner date guard so openings apply
-      _cfBannerDate = null;
-      applyOpeningsFromCFG();
-    }
-
-    // 4. Save clean session
-    if (typeof saveSession === 'function') saveSession();
-
-    // 5. Refresh UI
-    if (typeof refreshAllFinancials === 'function') refreshAllFinancials();
-    if (typeof refreshDashboard === 'function') refreshDashboard();
-    ['g','r','d'].forEach(function(f) {
-      try { refreshTankCard(f); } catch(e2) {}
-    });
-    refreshRecordBar();
-
-    // Show a brief carry-forward banner
-    refreshCarryBanner();
-    document.getElementById('rec-cf-banner').style.display = '';
-
-    if (typeof showToast === 'function') showToast('Ready for tomorrow ✓');
-    if (typeof sndConfirm === 'function') sndConfirm();
-    if (typeof vibe === 'function') vibe([15,10,20]);
-  } catch(e) {
-    console.error('[startTomorrow]', e);
-    if (typeof showToast === 'function') showToast('Could not prepare — please reload');
-  }
-}
-
-/* ── Hook auto-save into key actions ─────────────────────────────────── */
-(function () {
-  // Wrap saveAllReadings
-  var _origSAR = window.saveAllReadings;
-  if (typeof _origSAR === 'function') {
-    window.saveAllReadings = function () {
-      _origSAR.apply(this, arguments);
-      try { _triggerAutoSave(); setTimeout(refreshRecordBar, 50); } catch(e) {}
-    };
-  }
-  // Wrap saveStock
-  var _origSS = window.saveStock;
-  if (typeof _origSS === 'function') {
-    window.saveStock = function () {
-      _origSS.apply(this, arguments);
-      try { _triggerAutoSave(); setTimeout(refreshRecordBar, 50); } catch(e) {}
-    };
-  }
-  // Wrap confirmExpenses
-  var _origCE = window.confirmExpenses;
-  if (typeof _origCE === 'function') {
-    window.confirmExpenses = function () {
-      _origCE.apply(this, arguments);
-      try { _triggerAutoSave(); } catch(e) {}
-    };
-  }
-  // Wrap confirmTotalCash / confirmTotalBank
-  ['confirmTotalCash','confirmTotalBank'].forEach(function(fn) {
-    var orig = window[fn];
-    if (typeof orig === 'function') {
-      window[fn] = function () {
-        orig.apply(this, arguments);
-        try { _triggerAutoSave(); } catch(e) {}
-      };
-    }
-  });
-  // Wrap switchPage to refresh bar on record
-  var _origSP = window.switchPage;
-  if (typeof _origSP === 'function') {
-    window.switchPage = function (page) {
-      _origSP.apply(this, arguments);
-      if (page === 'record') {
-        setTimeout(function () {
-          try { refreshRecordBar(); refreshCarryBanner(); } catch(e) {}
-        }, 80);
-      }
-    };
-  }
-})();
-
-/* ── Init on load ─────────────────────────────────────────────────────── */
-document.addEventListener('DOMContentLoaded', function () {
-  setTimeout(function () {
-    try { refreshRecordBar(); } catch(e) {}
-    try { refreshCarryBanner(); } catch(e) {}
-  }, 300);
-});
-
-
-// ══════════════════════════════════════════════════════════════════════════════
-// CURRENCY PICKER
-// ══════════════════════════════════════════════════════════════════════════════
-function _curUpdateSettingsRow(){
-  const k=GCFG.currency||'SAR';
-  const cur=CURRENCIES[k]||CURRENCIES.SAR;
-  const badge=document.getElementById('cfg-cur-badge');
-  const sub=document.getElementById('cfg-cur-sub');
-  if(badge) badge.textContent=cur.sym;
-  if(sub)   sub.textContent=cur.name;
-}
-
-function _currencyRefreshAll(){
-  try{refreshAllFinancials();}catch(e){}   // collections, cash ledger, all setEl calls
-  try{animateFinCards();}catch(e){}        // dashboard financial counters
-  try{refreshDashboard();}catch(e){}       // dashboard header re-renders
-  try{renderOwnerDashboard();}catch(e){}   // owner hero + stat cards
-  // Conditionally refresh open panels
-  try{if(document.getElementById('page-history')?.classList.contains('pg-active'))applyHistFilter();}catch(e){}
-  try{if(document.getElementById('ov-pnl')?.classList.contains('open'))renderPnL();}catch(e){}
-  try{if(document.getElementById('mr-ovl')?.classList.contains('open'))renderMeterReport();}catch(e){}
-}
-
-function openCurrencyPicker(){
-  const row=document.getElementById('cfg-currency-row');
-  if(!row) return;
-  // Toggle
-  const existing=document.getElementById('cur-inline-picker');
-  if(existing){ existing.remove(); row.classList.remove('cur-open'); return; }
-
-  const role=getRole();
-  const canChange=(role==='owner'||role==='super_owner');
-  const cur=(GCFG&&GCFG.currency)||'SAR';
-
-  const CUR_COLORS={
-    SAR:'#10b981',BDT:'#3b82f6',USD:'#16a34a',
-    EUR:'#7c3aed',GBP:'#d97706',INR:'#ef4444',AED:'#0891b2'
-  };
-
-  const wrap=document.createElement('div');
-  wrap.id='cur-inline-picker';
-  wrap.style.cssText='background:#fff;border-radius:0 0 14px 14px;overflow:hidden;box-shadow:0 4px 16px rgba(0,0,0,.08);';
-
-  Object.entries(CURRENCIES).forEach(function([key,c],idx,arr){
-    const isSel=key===cur;
-    const col=CUR_COLORS[key]||'#6366f1';
-    const isLast=idx===arr.length-1;
-
-    const item=document.createElement('div');
-    item.style.cssText=
-      'display:flex;align-items:center;gap:14px;padding:12px 16px;'+
-      'border-bottom:'+(isLast?'none':'1px solid #f3f4f6')+';'+
-      'background:'+(isSel?'rgba(99,102,241,.04)':'#fff')+';'+
-      (canChange?'cursor:pointer;':'')+
-      '-webkit-tap-highlight-color:transparent;';
-
-    // Icon circle
-    const ico=document.createElement('div');
-    ico.style.cssText=
-      'width:40px;height:40px;border-radius:12px;flex-shrink:0;'+
-      'display:flex;align-items:center;justify-content:center;'+
-      'font-size:20px;font-weight:700;'+
-      'background:'+(isSel?col:'#f4f6f8')+';color:'+(isSel?'#fff':col)+';';
-    ico.textContent=c.icon;
-
-    // Code + name
-    const info=document.createElement('div');
-    info.style.cssText='flex:1;min-width:0;';
-    const codeEl=document.createElement('div');
-    codeEl.style.cssText='font-size:14px;font-weight:700;letter-spacing:-.1px;line-height:1.3;color:'+(isSel?'#4f46e5':'#111827')+';';
-    codeEl.textContent=key;
-    const nameEl=document.createElement('div');
-    nameEl.style.cssText='font-size:11.5px;color:#9ca3af;line-height:1.3;margin-top:1px;';
-    nameEl.textContent=c.name;
-    info.append(codeEl,nameEl);
-
-    // Symbol + checkmark
-    const right=document.createElement('div');
-    right.style.cssText='display:flex;align-items:center;gap:10px;flex-shrink:0;';
-    const sym=document.createElement('span');
-    sym.style.cssText='font-size:13px;font-weight:700;color:'+(isSel?col:'#c4c9d4')+';min-width:26px;text-align:right;font-family:monospace;';
-    sym.textContent=c.sym;
-    const chk=document.createElement('div');
-    chk.style.cssText=
-      'width:22px;height:22px;border-radius:50%;flex-shrink:0;'+
-      'border:2px solid '+(isSel?'#6366f1':'#e2e8f0')+';'+
-      'background:'+(isSel?'#6366f1':'transparent')+';'+
-      'display:flex;align-items:center;justify-content:center;';
-    if(isSel) chk.innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" style="width:11px;height:11px"><polyline points="20 6 9 17 4 12"/></svg>';
-    right.append(sym,chk);
-
-    item.append(ico,info,right);
-
-    if(canChange){
-      item.addEventListener('pointerdown',function(){item.style.background='rgba(99,102,241,.08)';});
-      item.addEventListener('pointerup',function(){item.style.background=isSel?'rgba(99,102,241,.04)':'#fff';});
-      item.addEventListener('click',function(){
-        GCFG.currency=key;
-        try{persistGCFG();}catch(e){}
-        applyCurrency();
-        _curUpdateSettingsRow();
-        wrap.remove();
-        row.classList.remove('cur-open');
-        showToast(c.sym+' ('+key+') applied');
-        _currencyRefreshAll();
-      });
-    }
-    wrap.appendChild(item);
-  });
-
-  if(!canChange){
-    const note=document.createElement('div');
-    note.style.cssText='padding:9px 16px;font-size:11px;color:#94a3b8;text-align:center;border-top:1px solid #f3f4f6;';
-    note.textContent='View only — only owners can change currency';
-    wrap.appendChild(note);
-  }
-
-  row.parentNode.insertBefore(wrap, row.nextSibling);
-  row.classList.add('cur-open');
-}
-
-function closeCurrencyPicker(){
-  const p=document.getElementById('cur-inline-picker');
-  if(p) p.remove();
-  const r=document.getElementById('cfg-currency-row');
-  if(r) r.classList.remove('cur-open');
-}
-
-/* ══════════════════════════════════════════════════════════════════════
-   PetroBook i18n Engine — PB18n
-   v1.0 | EN / BN | Self-contained, zero dependencies
-   Storage key: pb-lang-v1 (global, not per-pump)
-   ══════════════════════════════════════════════════════════════════════ */
-
-</script>
-
-</body>
-</html>
+     

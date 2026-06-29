@@ -197,46 +197,4 @@ service cloud.firestore {
 
     match /accounts/{aid}/pumps/{pid} {
       allow read:  if canAccessPump(aid, pid);
-      allow write: if canAccessPump(aid, pid) && isOwner();
-    }
-
-    match /accounts/{aid}/pumps/{pid}/data/config {
-      allow read:  if canAccessPump(aid, pid);
-      allow write: if canAccessPump(aid, pid) && isOwner();
-    }
-
-    match /accounts/{aid}/pumps/{pid}/data/snapshot {
-      allow read, write: if canAccessPump(aid, pid);
-    }
-
-    match /accounts/{aid}/pumps/{pid}/data/fuelHistory {
-      allow read:  if canAccessPump(aid, pid);
-      allow write: if canAccessPump(aid, pid) && isOwner();
-    }
-
-    match /accounts/{aid}/pumps/{pid}/history/{date} {
-      allow read:   if canAccessPump(aid, pid);
-      allow create: if canAccessPump(aid, pid);
-      allow update: if canAccessPump(aid, pid)
-                       && !(resource.data.get('locked', false) == true);
-      allow delete: if false;
-    }
-
-    match /accounts/{aid}/pumps/{pid}/ledger/{date} {
-      allow read:           if canAccessPump(aid, pid);
-      allow create, update: if canAccessPump(aid, pid);
-      allow delete:         if false;
-    }
-
-    match /accounts/{aid}/pumps/{pid}/records/{date} {
-      allow read, write: if canAccessPump(aid, pid);
-      allow delete:      if canAccessPump(aid, pid) && isOwner();
-    }
-
-
-    // ── Deny everything else ──────────────────────────────────────────────────
-    match /{document=**} {
-      allow read, write: if false;
-    }
-  }
-}
+      allow write: if canAccessPump(aid,

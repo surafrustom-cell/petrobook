@@ -1,0 +1,155 @@
+================================================================
+PETROBOOK FORENSIC AUDIT — PASTE INTO CHROME DEVTOOLS CONSOLE
+================================================================
+
+STEP 1: Open Chrome and go to https://petrobook-prod.web.app
+STEP 2: Press F12 to open DevTools
+STEP 3: Click the "Console" tab
+STEP 4: Click in the console input area
+STEP 5: Paste the script below (Ctrl+V)
+STEP 6: Press Enter
+
+=== COPY EVERYTHING BELOW THIS LINE ===
+
+(async function PETROBOOK_FORENSIC_AUDIT() {
+  console.clear();
+  const L = (m,t='info') => { const s={info:'color:#58a6ff',ok:'color:#3fb950;font-weight:bold',warn:'color:#d29922',err:'color:#f85149;font-weight:bold',step:'color:#a5d6ff;font-size:13px;font-weight:bold'}; console.log('%c[AUDIT] '+m,s[t]||''); };
+  L('=== PETROBOOK FORENSIC AUDIT V5 ===','step');
+  L('Project: '+firebase.app().options.projectId);
+
+  const auth=firebase.auth(), db=firebase.firestore();
+  const EMAIL='surafrustom@gmail.com', PASS='PetroBook@2026!';
+  const R={};
+
+  L('STEP 1: Signing in...','step');
+  await auth.signOut().catch(()=>{});
+  localStorage.clear(); sessionStorage.clear();
+  let user;
+  try {
+    const c = await auth.signInWithEmailAndPassword(EMAIL,PASS);
+    user=c.user;
+    L('STEP 1 OK — uid='+user.uid,'ok');
+    R.uid=user.uid; R.email=user.email;
+    R.providers=user.providerData.map(p=>p.providerId).join(', ');
+  } catch(e) {
+    L('STEP 1 FAILED: '+e.code+' '+e.message,'err');
+    R.signIn='FAILED:'+e.code; console.log(JSON.stringify(R,null,2)); return R;
+  }
+
+  L('STEP 2: Reading custom claims...','step');
+  const tok = await user.getIdTokenResult(true);
+  R.claims = tok.claims;
+  L('Claims: '+JSON.stringify(tok.claims),'ok');
+
+  L('STEP 3: Checking Firestore documents...','step');
+  const uid=user.uid;
+  const results={};
+
+  let cid=null;
+  try {
+    const p=await db.doc('userProfiles/'+uid).get();
+    if(p.exists){ cid=p.data().companyId; results['userProfiles/'+uid]={status:'EXISTS',data:p.data()}; L('userProfiles/'+uid+' EXISTS — cid='+cid,'ok'); }
+    else { results['userProfiles/'+uid]={status:'MISSING'}; L('userProfiles/'+uid+' MISSING','err'); }
+  } catch(e){ results['userProfiles/'+uid]={status:e.code==='permission-denied'?'PERMISSION_DENIED':'ERROR',error:e.code}; L('userProfiles/'+uid+' '+e.code,'err'); }
+
+  if(!cid){
+    L('No cid from userProfile — querying companies by ownerUid','warn');
+    try {
+      const s=await db.collection('companies').where('ownerUid','==',uid).limit(1).get();
+      if(!s.empty){ cid=s.docs[0].id; results['companies?ownerUid']={status:'FOUND',cid}; L('Found company by ownerUid: '+cid,'ok'); }
+      else { results['companies?ownerUid']={status:'NOT_FOUND'}; L('No company found by ownerUid','err'); }
+    } catch(e){ results['companies?ownerUid']={status:e.code,error:e.message}; L('companies query: '+e.code,'err'); }
+  }
+
+  R.companyId=cid;
+
+  if(cid){
+    try {
+      const d=await db.doc('companies/'+cid).get();
+      if(d.exists){ results['companies/'+cid]={status:'EXISTS',data:d.data()}; L('companies/'+cid+' EXISTS','ok'); }
+      else { results['companies/'+cid]={status:'MISSING'}; L('companies/'+cid+' MISSING','err'); }
+    } catch(e){ results['companies/'+cid]={status:e.code==='permission-denied'?'PERMISSION_DENIED':'ERROR',error:e.code}; L('companies/'+cid+' '+e.code,'err'); }
+
+    try {
+      const d=await db.doc('companies/'+cid+'/members/'+uid).get();
+      if(d.exists){ results['members/'+uid]={status:'EXISTS',data:d.data()}; L('members/'+uid+' EXISTS role='+d.data().role,'ok'); }
+      else { results['members/'+uid]={status:'MISSING'}; L('members/'+uid+' MISSING','err'); }
+    } catch(e){ results['members/'+uid]={status:e.code==='permission-denied'?'PERMISSION_DENIED':'ERROR',error:e.code}; L('members/'+uid+' '+e.code,'err'); }
+
+    try {
+      const d=await db.doc('companies/'+cid+'/global/config').get();
+      results['global/config']={status:d.exists?'EXISTS':'MISSING',data:d.exists?d.data():null};
+      L('global/config '+(d.exists?'EXISTS':'MISSING'),(d.exists?'ok':'warn'));
+    } catch(e){ results['global/config']={status:e.code,error:e.message}; }
+
+    try {
+      const s=await db.collection('companies/'+cid+'/pumps').limit(10).get();
+      results['pumps']={status:'EXISTS',count:s.size}; L('pumps: '+s.size+' found','ok');
+    } catch(e){ results['pumps']={status:e.code,error:e.message}; }
+  }
+
+  L('=== DOCUMENT STATUS ===','step');
+  console.table(results);
+  R.documents=results;
+
+  const up=results['userProfiles/'+uid]?.status;
+  const co=cid?results['companies/'+cid]?.status:'MISSING';
+  const me=cid?results['members/'+uid]?.status:'MISSING';
+  const issues=[];
+  if(up!=='EXISTS') issues.push('userProfiles/'+uid+' is '+up);
+  if(!cid) issues.push('No companyId — company was never created via doSetup()');
+  else if(co!=='EXISTS') issues.push('companies/'+cid+' is '+co);
+  if(cid && me!=='EXISTS') issues.push('members/'+uid+' is '+me);
+
+  if(issues.length===0){
+    L('ALL DOCUMENTS EXIST — Cross-device login WILL WORK','ok');
+  } else {
+    L(issues.length+' ISSUE(S) FOUND:','err');
+    issues.forEach(i=>L('  * '+i,'err'));
+    R.rootCause=issues;
+
+    if(cid && up!=='EXISTS'){
+      L('Repairing userProfiles/'+uid+'...','warn');
+      try { await db.doc('userProfiles/'+uid).set({companyId:cid,role:'owner',email:EMAIL,assignedPumps:[],repairedAt:new Date().toISOString()},{merge:true}); L('REPAIRED userProfiles/'+uid,'ok'); } catch(e){ L('REPAIR FAILED: '+e.code,'err'); }
+    }
+    if(cid && me!=='EXISTS'){
+      L('Repairing members/'+uid+'...','warn');
+      try { await db.doc('companies/'+cid+'/members/'+uid).set({uid,email:EMAIL,role:'owner',status:'active',assignedPumps:[],repairedAt:new Date().toISOString()},{merge:true}); L('REPAIRED members/'+uid,'ok'); } catch(e){ L('REPAIR FAILED: '+e.code,'err'); }
+    }
+    if(!cid){
+      L('','err');
+      L('NO COMPANY EXISTS IN FIRESTORE','err');
+      L('You must run doSetup() first:','warn');
+      L('  1. Open https://petrobook-prod.web.app','warn');
+      L('  2. Click "Set up my company"','warn');
+      L('  3. Fill in all fields and click Setup','warn');
+      L('  4. Then run this script again','warn');
+    }
+  }
+
+  R.localStorage={'pb-sync-active':localStorage.getItem('pb-sync-active'),'pb-company-id':localStorage.getItem('pb-company-id')};
+  L('localStorage: '+JSON.stringify(R.localStorage));
+
+  L('=== FULL RESULT (copy this for the report) ===','step');
+  console.log(JSON.stringify(R,null,2));
+  return R;
+})();
+
+=== COPY EVERYTHING ABOVE THIS LINE ===
+
+================================================================
+WHAT TO LOOK FOR IN THE RESULTS:
+  GREEN  = EXISTS      (document found in Firestore)
+  RED    = MISSING     (document not found — login will fail)
+  YELLOW = PERMISSION_DENIED (Firestore rules blocking read)
+
+IF "NO COMPANY EXISTS" appears:
+  → Go to https://petrobook-prod.web.app
+  → Click "Set up my company"
+  → Fill in: Station Name, Your Name, Email, Password
+  → Click Setup
+  → THEN run this script again
+
+IF documents exist but login still fails:
+  → Copy the full JSON output and paste it in the Claude chat
+================================================================

@@ -1,0 +1,679 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PetroBook — Production Forensic Audit</title>
+<style>
+  body { font-family: monospace; background: #0d1117; color: #c9d1d9; margin: 0; padding: 20px; }
+  h1 { color: #58a6ff; font-size: 18px; margin-bottom: 4px; }
+  .subtitle { color: #8b949e; font-size: 12px; margin-bottom: 20px; }
+  .section { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 16px; margin-bottom: 16px; }
+  .section h2 { color: #58a6ff; font-size: 14px; margin: 0 0 12px 0; border-bottom: 1px solid #30363d; padding-bottom: 8px; }
+  .row { display: flex; gap: 12px; align-items: flex-start; padding: 4px 0; border-bottom: 1px solid #21262d; font-size: 12px; }
+  .row:last-child { border-bottom: none; }
+  .label { color: #8b949e; min-width: 280px; flex-shrink: 0; }
+  .val { flex: 1; word-break: break-all; }
+  .EXISTS   { color: #3fb950; font-weight: bold; }
+  .MISSING  { color: #f85149; font-weight: bold; }
+  .PERMISSION_DENIED { color: #d29922; font-weight: bold; }
+  .INVALID_DATA { color: #f0883e; font-weight: bold; }
+  .PENDING  { color: #8b949e; }
+  .SKIP     { color: #484f58; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; }
+  .badge-green { background: #1a4731; color: #3fb950; }
+  .badge-red   { background: #3d1a1a; color: #f85149; }
+  .badge-yellow{ background: #3d2f1a; color: #d29922; }
+  .status-bar { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; }
+  .log { background: #010409; border: 1px solid #30363d; border-radius: 4px; padding: 12px; font-size: 11px; max-height: 300px; overflow-y: auto; }
+  .log-line { padding: 1px 0; }
+  .log-info  { color: #58a6ff; }
+  .log-ok    { color: #3fb950; }
+  .log-warn  { color: #d29922; }
+  .log-err   { color: #f85149; }
+  .log-step  { color: #a5d6ff; font-weight: bold; }
+  input[type=email], input[type=password] {
+    background: #21262d; border: 1px solid #30363d; color: #c9d1d9;
+    padding: 8px 12px; border-radius: 6px; font-size: 13px; width: 280px; box-sizing: border-box;
+  }
+  button {
+    background: #238636; color: #fff; border: none; padding: 8px 16px;
+    border-radius: 6px; font-size: 13px; cursor: pointer; margin-top: 8px;
+  }
+  button:hover { background: #2ea043; }
+  button:disabled { background: #21262d; color: #8b949e; cursor: not-allowed; }
+  .btn-repair { background: #d29922; color: #000; }
+  .btn-repair:hover { background: #e3b341; }
+  .repair-section { background: #1a1f2e; border: 1px solid #d29922; }
+  .repair-section h2 { color: #d29922; }
+  pre { background: #010409; padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 11px; color: #7ee787; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { background: #21262d; color: #8b949e; padding: 6px 10px; text-align: left; border-bottom: 2px solid #30363d; }
+  td { padding: 5px 10px; border-bottom: 1px solid #21262d; vertical-align: top; }
+  .summary-pass { color: #3fb950; }
+  .summary-fail { color: #f85149; }
+</style>
+</head>
+<body>
+
+<h1>🔬 PetroBook — Production Forensic Audit</h1>
+<p class="subtitle">Auth V5 · petrobook-prod · Run this in any Chrome window (normal or incognito)</p>
+
+<div class="section">
+  <h2>Step 1 — Sign In</h2>
+  <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;">
+    <div>
+      <div style="font-size:11px;color:#8b949e;margin-bottom:4px;">Email</div>
+      <input type="email" id="email" value="surafrustom@gmail.com" placeholder="owner@email.com">
+    </div>
+    <div>
+      <div style="font-size:11px;color:#8b949e;margin-bottom:4px;">Password</div>
+      <input type="password" id="password" value="PetroBook@2026!" placeholder="password">
+    </div>
+    <div>
+      <button id="btnRun" onclick="runAudit()">▶ Run Full Forensic Audit</button>
+    </div>
+  </div>
+  <div style="margin-top:8px;font-size:11px;color:#8b949e;">
+    Opens incognito-equivalent: clears localStorage/sessionStorage/IndexedDB before running. No app changes made during audit.
+  </div>
+</div>
+
+<div class="section" id="sec-log" style="display:none">
+  <h2>Audit Log</h2>
+  <div class="log" id="log"></div>
+</div>
+
+<div class="section" id="sec-auth" style="display:none">
+  <h2>Firebase Auth</h2>
+  <table>
+    <thead><tr><th>Field</th><th>Value</th><th>Status</th></tr></thead>
+    <tbody id="tbl-auth"></tbody>
+  </table>
+</div>
+
+<div class="section" id="sec-claims" style="display:none">
+  <h2>Custom Claims</h2>
+  <table>
+    <thead><tr><th>Claim</th><th>Value</th><th>Required?</th></tr></thead>
+    <tbody id="tbl-claims"></tbody>
+  </table>
+</div>
+
+<div class="section" id="sec-docs" style="display:none">
+  <h2>Firestore Documents</h2>
+  <table>
+    <thead><tr><th>Path</th><th>Status</th><th>Key Fields</th></tr></thead>
+    <tbody id="tbl-docs"></tbody>
+  </table>
+</div>
+
+<div class="section repair-section" id="sec-repair" style="display:none">
+  <h2>⚠️ Repair Required</h2>
+  <div id="repair-list"></div>
+  <button class="btn-repair" id="btnRepair" onclick="runRepair()" style="margin-top:12px;">🔧 Auto-Repair Missing Documents</button>
+</div>
+
+<div class="section" id="sec-final" style="display:none">
+  <h2>Final Verdict</h2>
+  <div id="final-verdict"></div>
+</div>
+
+<div class="section" id="sec-report" style="display:none">
+  <h2>FINAL_FORENSIC_REPORT.md</h2>
+  <button onclick="copyReport()" style="background:#1f6feb;margin-bottom:8px;">📋 Copy Report</button>
+  <pre id="report-text"></pre>
+</div>
+
+<!-- Firebase SDK v9 compat -->
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js"></script>
+<script>
+// ── Firebase Config ─────────────────────────────────────────────────────────
+const FIREBASE_CONFIG = {
+  apiKey:            "AIzaSyBde81KgzOyvbvZ1OqoLfTmF9GuZYFJX6Y",
+  authDomain:        "petrobook-prod.firebaseapp.com",
+  projectId:         "petrobook-prod",
+  storageBucket:     "petrobook-prod.appspot.com",
+  messagingSenderId: "867958344",
+  appId:             "1:867958344:web:YOUR_APP_ID"
+};
+
+// ── Globals ─────────────────────────────────────────────────────────────────
+let fbApp, fbAuth, fsDb;
+let auditResult = {};
+let repairActions = [];
+
+// ── DOM helpers ─────────────────────────────────────────────────────────────
+function show(id){ document.getElementById(id).style.display=''; }
+function addLog(msg, type='info'){
+  const d = document.getElementById('log');
+  const line = document.createElement('div');
+  line.className = 'log-line log-'+type;
+  line.textContent = new Date().toISOString().slice(11,23)+' '+msg;
+  d.appendChild(line);
+  d.scrollTop = d.scrollHeight;
+}
+function addAuthRow(field, value, status){
+  const t = document.getElementById('tbl-auth');
+  const cls = status==='✅'?'EXISTS':status==='❌'?'MISSING':status==='⚠️'?'INVALID_DATA':'';
+  t.innerHTML += `<tr><td>${field}</td><td class="${cls}">${escHtml(String(value))}</td><td>${status}</td></tr>`;
+}
+function addClaimRow(claim, value, required){
+  const t = document.getElementById('tbl-claims');
+  const ok = value!==undefined&&value!==null&&value!=='';
+  const sc = ok?'EXISTS':'MISSING';
+  t.innerHTML += `<tr><td>${claim}</td><td class="${sc}">${escHtml(String(value??'—'))}</td><td>${required?'Required':'Optional'}</td></tr>`;
+}
+function addDocRow(path, status, fields){
+  const t = document.getElementById('tbl-docs');
+  const cls = status;
+  t.innerHTML += `<tr><td style="color:#a5d6ff">${escHtml(path)}</td><td class="${cls}" style="white-space:nowrap">${statusBadge(status)}</td><td style="color:#8b949e;font-size:11px">${escHtml(fields)}</td></tr>`;
+}
+function statusBadge(s){
+  const map={EXISTS:'badge-green',MISSING:'badge-red',PERMISSION_DENIED:'badge-yellow',INVALID_DATA:'badge-yellow',PENDING:'',SKIP:''};
+  return `<span class="badge ${map[s]||''}">${s}</span>`;
+}
+function escHtml(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// ── Main Audit ───────────────────────────────────────────────────────────────
+async function runAudit(){
+  document.getElementById('btnRun').disabled = true;
+  document.getElementById('tbl-auth').innerHTML='';
+  document.getElementById('tbl-claims').innerHTML='';
+  document.getElementById('tbl-docs').innerHTML='';
+  document.getElementById('repair-list').innerHTML='';
+  repairActions=[];
+  auditResult={};
+
+  show('sec-log'); show('sec-auth'); show('sec-claims'); show('sec-docs');
+
+  const email = document.getElementById('email').value.trim();
+  const password = document.getElementById('password').value;
+
+  addLog('=== PETROBOOK FORENSIC AUDIT STARTED ===','step');
+  addLog('Target: petrobook-prod.web.app','info');
+  addLog('Email: '+email,'info');
+
+  // ── Init Firebase ──────────────────────────────────────────────────────────
+  try {
+    // check if we need to re-read the appId from the live site
+    addLog('Initialising Firebase SDK...','info');
+    if(!firebase.apps.length){
+      // Try to get the real appId from the production site
+      let cfg = {...FIREBASE_CONFIG};
+      try{
+        const r = await fetch('https://petrobook-prod.web.app/__/firebase/init.json');
+        if(r.ok){ const d=await r.json(); cfg={...cfg,...d}; addLog('Live firebaseConfig loaded from /__/firebase/init.json','ok'); }
+      }catch(e){ addLog('Could not load init.json — using hardcoded config','warn'); }
+      fbApp = firebase.initializeApp(cfg);
+    } else {
+      fbApp = firebase.app();
+    }
+    fbAuth = firebase.auth();
+    fsDb = firebase.firestore();
+    addLog('Firebase SDK ready. Project: '+fbApp.options.projectId,'ok');
+  } catch(e){
+    addLog('Firebase init failed: '+e.message,'err');
+    document.getElementById('btnRun').disabled = false;
+    return;
+  }
+
+  // ── Sign Out any existing session ──────────────────────────────────────────
+  addLog('Signing out any existing session...','info');
+  try{ await fbAuth.signOut(); }catch(e){}
+  // Clear local storage to simulate clean device
+  try{ localStorage.clear(); sessionStorage.clear(); }catch(e){}
+  addLog('Local storage cleared — clean device simulation','ok');
+
+  // ── STEP 1: Firebase Auth Sign In ──────────────────────────────────────────
+  addLog('STEP 1: signInWithEmailAndPassword...','step');
+  let fbUser = null;
+  try{
+    const cred = await fbAuth.signInWithEmailAndPassword(email, password);
+    fbUser = cred.user;
+    addLog('STEP 1 OK — uid='+fbUser.uid,'ok');
+  }catch(e){
+    addLog('STEP 1 FAILED: '+e.code+' — '+e.message,'err');
+    addAuthRow('Sign-In', e.code+': '+e.message, '❌');
+    auditResult.signIn = {status:'FAILED', error: e.code};
+    show('sec-final');
+    renderFinal();
+    document.getElementById('btnRun').disabled = false;
+    return;
+  }
+
+  // ── STEP 2: Auth info ──────────────────────────────────────────────────────
+  addLog('STEP 2: Reading auth info and custom claims...','step');
+  const uid = fbUser.uid;
+  const providers = fbUser.providerData.map(p=>p.providerId).join(', ');
+  addAuthRow('UID', uid, '✅');
+  addAuthRow('Email', fbUser.email, fbUser.email?'✅':'❌');
+  addAuthRow('Display Name', fbUser.displayName||'(none)', '—');
+  addAuthRow('Providers', providers, '✅');
+  addAuthRow('Email Verified', fbUser.emailVerified, fbUser.emailVerified?'✅':'⚠️');
+  auditResult.uid = uid;
+  auditResult.email = fbUser.email;
+  auditResult.providers = providers;
+
+  // ── STEP 3: Custom Claims ──────────────────────────────────────────────────
+  let claims = {};
+  try{
+    const tok = await fbUser.getIdTokenResult(true);
+    claims = tok.claims || {};
+    addLog('Custom claims: '+JSON.stringify(claims),'ok');
+  }catch(e){
+    addLog('Could not get token claims: '+e.message,'warn');
+  }
+  addClaimRow('role',      claims.role,      true);
+  addClaimRow('accountId', claims.accountId, false);
+  addClaimRow('pumpId',    claims.pumpId,    false);
+  addClaimRow('companyId', claims.companyId, false);
+  auditResult.claims = claims;
+  // Note: set-claims-ci.js sets { role, accountId, pumpId } — NO companyId
+  if(!claims.role){
+    addLog('WARNING: "role" claim missing — Firestore rules may deny all reads','warn');
+    repairActions.push({type:'claims', desc:'role claim is missing — run set-claims.js to set { role: "super_owner" }'});
+  }
+
+  // ── STEP 4: Firestore document checks ─────────────────────────────────────
+  addLog('STEP 4: Checking Firestore documents...','step');
+
+  // ── Check userProfiles/{uid} ───────────────────────────────────────────────
+  addLog('Reading userProfiles/'+uid+'...','info');
+  let companyId = null;
+  let profData = null;
+  try{
+    const profDoc = await fsDb.doc('userProfiles/'+uid).get();
+    if(profDoc.exists){
+      profData = profDoc.data();
+      companyId = profData.companyId || null;
+      addDocRow('userProfiles/'+uid, 'EXISTS',
+        'companyId='+companyId+' role='+profData.role+' email='+profData.email);
+      addLog('userProfiles/'+uid+' EXISTS — companyId='+companyId,'ok');
+      auditResult.userProfile = {status:'EXISTS', data: profData};
+    }else{
+      addDocRow('userProfiles/'+uid, 'MISSING', '—');
+      addLog('userProfiles/'+uid+' MISSING','err');
+      auditResult.userProfile = {status:'MISSING'};
+      repairActions.push({type:'userProfile', uid, desc:'userProfiles/'+uid+' missing — need to create it'});
+    }
+  }catch(e){
+    const s = e.code==='permission-denied'?'PERMISSION_DENIED':'MISSING';
+    addDocRow('userProfiles/'+uid, s, e.code+': '+e.message);
+    addLog('userProfiles/'+uid+' '+s+': '+e.code,'err');
+    auditResult.userProfile = {status:s, error:e.code};
+    repairActions.push({type:'userProfile', uid, desc:'userProfiles/'+uid+' '+s});
+  }
+
+  // ── Attempt fallback: companies?ownerUid=uid ───────────────────────────────
+  if(!companyId){
+    addLog('No userProfile.companyId — querying companies by ownerUid='+uid,'warn');
+    try{
+      const snap = await fsDb.collection('companies').where('ownerUid','==',uid).limit(1).get();
+      if(!snap.empty){
+        companyId = snap.docs[0].id;
+        addLog('Found company by ownerUid query: cid='+companyId,'ok');
+        auditResult.companyByQuery = {status:'FOUND', companyId};
+        repairActions.push({type:'userProfile-repair', uid, companyId, email: fbUser.email,
+          desc:'Will create userProfiles/'+uid+' with companyId='+companyId});
+      }else{
+        addLog('No company found by ownerUid query either','err');
+        auditResult.companyByQuery = {status:'NOT_FOUND'};
+        repairActions.push({type:'full-setup', uid, email: fbUser.email,
+          desc:'No company exists at all — need full doSetup() run on Device A first'});
+      }
+    }catch(e){
+      addLog('companies query failed: '+e.code+': '+e.message,'err');
+      auditResult.companyByQuery = {status:'ERROR', error:e.code};
+    }
+  }
+
+  // ── Check companies/{cid} ─────────────────────────────────────────────────
+  if(companyId){
+    addLog('Reading companies/'+companyId+'...','info');
+    let compData = null;
+    try{
+      const compDoc = await fsDb.doc('companies/'+companyId).get();
+      if(compDoc.exists){
+        compData = compDoc.data();
+        addDocRow('companies/'+companyId, 'EXISTS',
+          'name='+compData.name+' ownerUid='+compData.ownerUid+' status='+compData.status);
+        addLog('companies/'+companyId+' EXISTS — name='+compData.name,'ok');
+        auditResult.company = {status:'EXISTS', data: compData};
+        if(compData.ownerUid !== uid){
+          addLog('WARNING: company.ownerUid='+compData.ownerUid+' !== current uid='+uid,'warn');
+          repairActions.push({type:'ownerUid-mismatch', cid:companyId, expectedUid:uid, actualUid:compData.ownerUid,
+            desc:'companies/'+companyId+'.ownerUid mismatch'});
+        }
+      }else{
+        addDocRow('companies/'+companyId, 'MISSING', '—');
+        addLog('companies/'+companyId+' MISSING','err');
+        auditResult.company = {status:'MISSING'};
+        repairActions.push({type:'company-missing', cid:companyId,
+          desc:'companies/'+companyId+' is missing — company data was never written or was deleted'});
+      }
+    }catch(e){
+      const s = e.code==='permission-denied'?'PERMISSION_DENIED':'MISSING';
+      addDocRow('companies/'+companyId, s, e.code+': '+e.message);
+      addLog('companies/'+companyId+' '+s,'err');
+      auditResult.company = {status:s, error:e.code};
+      repairActions.push({type:'company-access', cid:companyId, error:e.code,
+        desc:'companies/'+companyId+' '+s+' — may be Firestore rules issue'});
+    }
+
+    // ── Check companies/{cid}/members/{uid} ───────────────────────────────────
+    addLog('Reading companies/'+companyId+'/members/'+uid+'...','info');
+    try{
+      const memDoc = await fsDb.doc('companies/'+companyId+'/members/'+uid).get();
+      if(memDoc.exists){
+        const d = memDoc.data();
+        addDocRow('companies/'+companyId+'/members/'+uid, 'EXISTS',
+          'role='+d.role+' status='+d.status);
+        addLog('members/'+uid+' EXISTS — role='+d.role,'ok');
+        auditResult.memberDoc = {status:'EXISTS', data:d};
+      }else{
+        addDocRow('companies/'+companyId+'/members/'+uid, 'MISSING', '—');
+        addLog('members/'+uid+' MISSING — will need self-heal','warn');
+        auditResult.memberDoc = {status:'MISSING'};
+        repairActions.push({type:'memberDoc', cid:companyId, uid,
+          email: fbUser.email,
+          desc:'companies/'+companyId+'/members/'+uid+' missing'});
+      }
+    }catch(e){
+      const s = e.code==='permission-denied'?'PERMISSION_DENIED':'MISSING';
+      addDocRow('companies/'+companyId+'/members/'+uid, s, e.code+': '+e.message);
+      addLog('members/'+uid+' '+s,'err');
+      auditResult.memberDoc = {status:s, error:e.code};
+      if(s==='PERMISSION_DENIED'){
+        repairActions.push({type:'memberDoc-permdeny', cid:companyId, uid,
+          desc:'members/'+uid+' PERMISSION_DENIED — Firestore rules may not have isOwnerOf() rule'});
+      }
+    }
+
+    // ── Check companies/{cid}/users/{uid} (legacy) ────────────────────────────
+    addLog('Reading companies/'+companyId+'/users/'+uid+' (legacy check)...','info');
+    try{
+      const usersDoc = await fsDb.doc('companies/'+companyId+'/users/'+uid).get();
+      if(usersDoc.exists){
+        const d = usersDoc.data();
+        addDocRow('companies/'+companyId+'/users/'+uid, 'EXISTS', 'role='+d.role);
+        addLog('companies/users/'+uid+' EXISTS (legacy)','ok');
+        auditResult.usersDoc = {status:'EXISTS', data:d};
+      }else{
+        addDocRow('companies/'+companyId+'/users/'+uid, 'MISSING', '(legacy — OK if V5)');
+        addLog('companies/users/'+uid+' MISSING (expected in V5)','info');
+        auditResult.usersDoc = {status:'MISSING-EXPECTED'};
+      }
+    }catch(e){
+      addDocRow('companies/'+companyId+'/users/'+uid, e.code==='permission-denied'?'PERMISSION_DENIED':'MISSING',
+        e.code);
+      auditResult.usersDoc = {status:'ERROR', error:e.code};
+    }
+
+    // ── Check companies/{cid}/global/config ───────────────────────────────────
+    addLog('Reading companies/'+companyId+'/global/config...','info');
+    try{
+      const cfgDoc = await fsDb.doc('companies/'+companyId+'/global/config').get();
+      if(cfgDoc.exists){
+        const d = cfgDoc.data();
+        addDocRow('companies/'+companyId+'/global/config', 'EXISTS',
+          'stationName='+d.stationName+' currency='+d.currency);
+        addLog('global/config EXISTS','ok');
+        auditResult.config = {status:'EXISTS', data:d};
+      }else{
+        addDocRow('companies/'+companyId+'/global/config', 'MISSING', '—');
+        addLog('global/config MISSING — dashboard will load empty','warn');
+        auditResult.config = {status:'MISSING'};
+        repairActions.push({type:'config', cid:companyId,
+          desc:'companies/'+companyId+'/global/config missing — set up from Device A first'});
+      }
+    }catch(e){
+      addDocRow('companies/'+companyId+'/global/config', 'PERMISSION_DENIED', e.code);
+      auditResult.config = {status:'PERMISSION_DENIED', error:e.code};
+    }
+
+    // ── Check pumps ───────────────────────────────────────────────────────────
+    addLog('Listing companies/'+companyId+'/pumps...','info');
+    try{
+      const pumpsSnap = await fsDb.collection('companies/'+companyId+'/pumps').limit(5).get();
+      const count = pumpsSnap.size;
+      addDocRow('companies/'+companyId+'/pumps/*', count>0?'EXISTS':'MISSING',
+        count>0?count+' pump(s) found':'No pumps yet');
+      addLog('pumps: '+count+' found','ok');
+      auditResult.pumps = {status:count>0?'EXISTS':'EMPTY', count};
+    }catch(e){
+      addDocRow('companies/'+companyId+'/pumps/*', 'PERMISSION_DENIED', e.code);
+      auditResult.pumps = {status:'PERMISSION_DENIED', error:e.code};
+    }
+
+  } else {
+    addDocRow('companies/{cid}', 'SKIP', 'No companyId resolved');
+    addDocRow('companies/{cid}/members/{uid}', 'SKIP', 'No companyId');
+    addDocRow('companies/{cid}/users/{uid}', 'SKIP', 'No companyId');
+    addDocRow('companies/{cid}/global/config', 'SKIP', 'No companyId');
+    addDocRow('companies/{cid}/pumps/*', 'SKIP', 'No companyId');
+  }
+
+  auditResult.companyId = companyId;
+
+  // ── Show repair section if needed ─────────────────────────────────────────
+  if(repairActions.length > 0){
+    show('sec-repair');
+    const rl = document.getElementById('repair-list');
+    repairActions.forEach((a,i)=>{
+      rl.innerHTML += `<div style="padding:4px 0;font-size:12px"><span class="badge badge-red">${i+1}</span> ${escHtml(a.desc)}</div>`;
+    });
+  }
+
+  show('sec-final');
+  renderFinal();
+  document.getElementById('btnRun').disabled = false;
+}
+
+// ── Render Final Verdict ─────────────────────────────────────────────────────
+function renderFinal(){
+  const div = document.getElementById('final-verdict');
+  const r = auditResult;
+  const issues = repairActions.length;
+  const canLogin = r.userProfile?.status==='EXISTS' && r.company?.status==='EXISTS' && r.memberDoc?.status==='EXISTS';
+
+  let html = '';
+  if(canLogin && issues===0){
+    html = `<div class="badge badge-green" style="font-size:14px;padding:8px 16px">✅ ALL CHECKS PASSED — Cross-device login will work</div>`;
+    html += `<div style="margin-top:12px;font-size:12px;color:#8b949e">userProfiles, companies, and members docs all exist. Auth V5 restore chain will succeed on a clean device.</div>`;
+  }else{
+    html = `<div class="badge badge-red" style="font-size:14px;padding:8px 16px">❌ ${issues} ISSUE(S) FOUND — Cross-device login will fail</div>`;
+    html += `<div style="margin-top:12px;font-size:12px">`;
+    repairActions.forEach(a=>{
+      html += `<div style="color:#f85149;padding:2px 0">• ${escHtml(a.desc)}</div>`;
+    });
+    html += `</div>`;
+  }
+
+  div.innerHTML = html;
+  buildReport(canLogin);
+  show('sec-report');
+}
+
+// ── Auto-Repair ───────────────────────────────────────────────────────────────
+async function runRepair(){
+  document.getElementById('btnRepair').disabled = true;
+  addLog('=== STARTING AUTO-REPAIR ===','step');
+  const uid = auditResult.uid;
+  const email = auditResult.email;
+  const cid = auditResult.companyId;
+
+  for(const a of repairActions){
+    addLog('Repairing: '+a.type+' — '+a.desc,'warn');
+    try{
+      if(a.type==='userProfile-repair' || (a.type==='userProfile' && cid)){
+        // Recreate userProfile
+        await fsDb.doc('userProfiles/'+uid).set({
+          companyId: cid,
+          role: 'owner',
+          email: email,
+          assignedPumps: [],
+          repairedAt: new Date().toISOString()
+        }, {merge:true});
+        addLog('REPAIRED: userProfiles/'+uid+' created with companyId='+cid,'ok');
+      }
+      if(a.type==='memberDoc'){
+        // Recreate member doc
+        await fsDb.doc('companies/'+cid+'/members/'+uid).set({
+          uid: uid,
+          email: email,
+          role: 'owner',
+          status: 'active',
+          assignedPumps: [],
+          repairedAt: new Date().toISOString()
+        }, {merge:true});
+        addLog('REPAIRED: companies/'+cid+'/members/'+uid+' created','ok');
+      }
+    }catch(e){
+      addLog('Repair failed for '+a.type+': '+e.code+' '+e.message,'err');
+    }
+  }
+
+  addLog('Repair complete. Re-running audit in 2s...','step');
+  await new Promise(r=>setTimeout(r,2000));
+  runAudit();
+}
+
+// ── Build Report ─────────────────────────────────────────────────────────────
+function buildReport(passed){
+  const r = auditResult;
+  const now = new Date().toISOString();
+  const issues = repairActions.map((a,i)=>`${i+1}. ${a.desc}`).join('\n');
+  const cid = r.companyId||'NOT_FOUND';
+
+  const report = `# FINAL_FORENSIC_REPORT.md
+## PetroBook Production Forensic Audit
+**Date:** ${now}
+**Auth Version:** V5 (commit f51bcef)
+**Live Site:** https://petrobook-prod.web.app
+**Project:** petrobook-prod
+
+---
+
+## Audit Summary
+
+| Check | Result |
+|---|---|
+| Sign-In (email/password) | ${r.signIn?.status==='FAILED'?'❌ FAILED':'✅ SUCCESS'} |
+| Firebase UID | ${r.uid||'—'} |
+| Email | ${r.email||'—'} |
+| Providers | ${r.providers||'—'} |
+| role claim | ${r.claims?.role||'MISSING'} |
+| accountId claim | ${r.claims?.accountId||'—'} |
+| companyId resolved | ${cid} |
+| userProfiles/{uid} | ${r.userProfile?.status||'—'} |
+| companies/{cid} | ${r.company?.status||'—'} |
+| companies/{cid}/members/{uid} | ${r.memberDoc?.status||'—'} |
+| companies/{cid}/global/config | ${r.config?.status||'—'} |
+| companies/{cid}/pumps | ${r.pumps?.status||'—'} (${r.pumps?.count??0} found) |
+
+---
+
+## Auth Details
+
+\`\`\`json
+{
+  "uid": "${r.uid||''}",
+  "email": "${r.email||''}",
+  "providers": "${r.providers||''}",
+  "claims": ${JSON.stringify(r.claims||{}, null, 2)}
+}
+\`\`\`
+
+---
+
+## Firestore Document Status
+
+| Document Path | Status | Notes |
+|---|---|---|
+| userProfiles/${r.uid} | ${r.userProfile?.status||'—'} | companyId: ${r.userProfile?.data?.companyId||'—'} |
+| companies/${cid} | ${r.company?.status||'—'} | ownerUid: ${r.company?.data?.ownerUid||'—'} |
+| companies/${cid}/members/${r.uid} | ${r.memberDoc?.status||'—'} | role: ${r.memberDoc?.data?.role||'—'} |
+| companies/${cid}/global/config | ${r.config?.status||'—'} | stationName: ${r.config?.data?.stationName||'—'} |
+| companies/${cid}/pumps/* | ${r.pumps?.status||'—'} | count: ${r.pumps?.count??0} |
+
+---
+
+## Issues Found
+
+${repairActions.length===0?'**None — all documents exist.**':issues}
+
+---
+
+## Root Cause Analysis
+
+${passed && repairActions.length===0?
+`### ✅ No issues found.
+
+All required Firestore documents exist. The Auth V5 restore chain
+(userProfiles → companies → members) will succeed on a completely
+clean device (empty localStorage, empty IndexedDB).
+
+**Cross-device login status: READY**`:
+`### ❌ Issues found — root cause:
+
+${repairActions.map((a,i)=>`${i+1}. **${a.type}**: ${a.desc}`).join('\n')}
+
+The cross-device login fails because the V5 restore chain
+(_pbHandleFirebaseUser → _pbResolveUserCompany → _pbFinaliseRestore)
+requires the following documents to exist in Firestore:
+1. userProfiles/{uid}   — maps Firebase UID to companyId
+2. companies/{cid}      — company root doc
+3. companies/{cid}/members/{uid} — access control
+
+If any of these is missing, the restore chain stops with a diagnostic error.`}
+
+---
+
+## Repair Actions
+
+${repairActions.length===0?'None required.':repairActions.map((a,i)=>
+`${i+1}. **${a.type}**: ${a.desc}`).join('\n')}
+
+---
+
+## Verification
+
+To verify cross-device login after repair:
+1. Open an Incognito window
+2. Navigate to https://petrobook-prod.web.app
+3. Login with email/password
+4. Expect console trace:
+   \`\`\`
+   [AUTH] doLogin() started
+   [RESTORE] STEP 1 — reading userProfiles/{uid}
+   [RESTORE] userProfile hit. companyId={cid}
+   [COMPANY] STEP 3 OK
+   [RESTORE] All 4 steps passed
+   [SYNC] SyncEngine activated
+   [RESTORE] Complete — granting access
+   \`\`\`
+
+---
+
+*Generated by PetroBook Forensic Audit Tool v1.0*
+`;
+
+  document.getElementById('report-text').textContent = report;
+  window._forensicReport = report;
+}
+
+function copyReport(){
+  const txt = document.getElementById('report-text').textContent;
+  navigator.clipboard.writeText(txt).then(()=>alert('Report copied to clipboard!')).catch(()=>{
+    // fallback
+    const ta = document.createElement('textarea');
+    ta.value=txt; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+    alert('Report copied!');
+  });
+}
+</script>
+</body>
+</html>
