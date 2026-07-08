@@ -126,23 +126,13 @@ service cloud.firestore {
 
     // ── Company global config ────────────────────────────────────────────────
     // v3: isOwnerOf(cid) added — owner can load config even if member doc missing.
-    // v5: Specific overrides for manager-writable docs (saveCash, saveLang).
-    //     Wildcard /global/{doc} remains owner-only for all other global docs.
+    // v5: Managers can write config (saveCash daily figures) and lang (saveLang) only.
+    //     Uses doc wildcard in allow expression — avoids overlapping sibling match paths.
     match /companies/{cid}/global/{doc} {
       allow read:  if isMemberOf(cid) || isOwnerOf(cid);
-      allow write: if (isMemberOf(cid) || isOwnerOf(cid)) && isOwner();
-    }
-
-    // Cash/bank totals (saveCash) — managers update daily figures.
-    match /companies/{cid}/global/config {
-      allow read:  if isMemberOf(cid) || isOwnerOf(cid);
-      allow write: if (isMemberOf(cid) || isOwnerOf(cid)) && noPassHash();
-    }
-
-    // Language preference (saveLang) — managers can change display language.
-    match /companies/{cid}/global/lang {
-      allow read:  if isMemberOf(cid) || isOwnerOf(cid);
-      allow write: if (isMemberOf(cid) || isOwnerOf(cid)) && noPassHash();
+      // Owners can write any global doc. Managers can write only config + lang.
+      allow write: if (isMemberOf(cid) || isOwnerOf(cid)) &&
+                      (isOwner() || ((doc == 'config' || doc == 'lang') && noPassHash()));
     }
 
     // ── Company pumps ────────────────────────────────────────────────────────
@@ -196,4 +186,8 @@ service cloud.firestore {
     //  LEGACY: accounts/{aid}/... (v1.2 rules — UNCHANGED for backward compat)
     //  Existing accounts continue to work with zero changes.
     //  Migration runs in background on first SaaS-aware login.
-    // ══════════════════════
+    // ══════════════════════════════════════════════════════════════════════════
+
+    match /accounts/{aid}/users/{userId} {
+      allow read:           if ownsAccount(aid);
+      allow create, update: if ownsAccount(aid) && isOwner() && noPassHash();
