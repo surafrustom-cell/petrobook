@@ -126,13 +126,11 @@ service cloud.firestore {
 
     // ── Company global config ────────────────────────────────────────────────
     // v3: isOwnerOf(cid) added — owner can load config even if member doc missing.
-    // v5: Managers can write config (saveCash daily figures) and lang (saveLang) only.
-    //     Uses doc wildcard in allow expression — avoids overlapping sibling match paths.
+    // ── Company global config ────────────────────────────────────────────────
+    // v5: Members can write config (saveCash) and lang (saveLang). noPassHash() blocks passHash.
     match /companies/{cid}/global/{doc} {
       allow read:  if isMemberOf(cid) || isOwnerOf(cid);
-      // Owners can write any global doc. Managers can write only config + lang.
-      allow write: if (isMemberOf(cid) || isOwnerOf(cid)) &&
-                      (isOwner() || ((doc == 'config' || doc == 'lang') && noPassHash()));
+      allow write: if (isMemberOf(cid) || isOwnerOf(cid)) && noPassHash();
     }
 
     // ── Company pumps ────────────────────────────────────────────────────────
@@ -191,3 +189,56 @@ service cloud.firestore {
     match /accounts/{aid}/users/{userId} {
       allow read:           if ownsAccount(aid);
       allow create, update: if ownsAccount(aid) && isOwner() && noPassHash();
+      allow delete:         if ownsAccount(aid) && isSuperOwner();
+    }
+
+    match /accounts/{aid}/global/{doc} {
+      allow read:  if ownsAccount(aid);
+      allow write: if ownsAccount(aid) && isOwner();
+    }
+
+    match /accounts/{aid}/pumps/{pid} {
+      allow read:  if canAccessPump(aid, pid);
+      allow write: if canAccessPump(aid, pid) && isOwner();
+    }
+
+    match /accounts/{aid}/pumps/{pid}/data/config {
+      allow read:  if canAccessPump(aid, pid);
+      allow write: if canAccessPump(aid, pid) && isOwner();
+    }
+
+    match /accounts/{aid}/pumps/{pid}/data/snapshot {
+      allow read, write: if canAccessPump(aid, pid);
+    }
+
+    match /accounts/{aid}/pumps/{pid}/data/fuelHistory {
+      allow read:  if canAccessPump(aid, pid);
+      allow write: if canAccessPump(aid, pid) && isOwner();
+    }
+
+    match /accounts/{aid}/pumps/{pid}/history/{date} {
+      allow read:   if canAccessPump(aid, pid);
+      allow create: if canAccessPump(aid, pid);
+      allow update: if canAccessPump(aid, pid)
+                       && !(resource.data.get('locked', false) == true);
+      allow delete: if false;
+    }
+
+    match /accounts/{aid}/pumps/{pid}/ledger/{date} {
+      allow read:           if canAccessPump(aid, pid);
+      allow create, update: if canAccessPump(aid, pid);
+      allow delete:         if false;
+    }
+
+    match /accounts/{aid}/pumps/{pid}/records/{date} {
+      allow read, write: if canAccessPump(aid, pid);
+      allow delete:      if canAccessPump(aid, pid) && isOwner();
+    }
+
+
+    // ── Deny everything else ──────────────────────────────────────────────────
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
