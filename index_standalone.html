@@ -40131,4 +40131,971 @@ function _pbInitStorage(){
               _pbHandleFirebaseUser(result.user, null);
             }
           }).catch(function(e){
-            console.warn('[AUTH] ge
+            console.warn('[AUTH] getRedirectResult failed:',e.code,e.message||e);
+            if(e.code==='auth/unauthorized-domain'){
+              console.error('[AUTH] UNAUTHORIZED DOMAIN — add to Firebase Console > Authentication > Settings > Authorized domains');
+            }
+          });
+        }
+      })();
+      // Auth v3: Always register the onAuthStateChanged handler — not gated on
+      // pb-sync-active. This ensures cross-device restores work on fresh devices
+      // where pb-sync-active is not yet set. SyncEngine activation is deferred
+      // until _pbFinaliseRestore() (called by _pbHandleFirebaseUser or legacy path).
+      //
+      // ALSO: if pb-sync-active=1 is already set (same device, returning user),
+      // immediately activate SyncEngine + auth bridge so sync resumes without
+      // requiring a full login.
+      if(localStorage.getItem('pb-sync-active') === '1'){
+        try{
+          // 1. Flip the SyncEngine flag so _intercept() starts queueing writes
+          if(typeof SyncEngine !== 'undefined') SyncEngine.ACTIVE = true;
+          // 2. Switch StorageService to use SyncEngine so all app writes are intercepted
+          if(typeof StorageService !== 'undefined' && typeof SyncEngine !== 'undefined'){
+            StorageService.setProvider(SyncEngine);
+          }
+          // 3. Activate the auth bridge (requires SyncEngine.ACTIVE=true + PB_FirebaseAuth ready)
+          if(typeof PB_AuthBridge !== 'undefined') PB_AuthBridge.activate();
+        }catch(e){ console.warn('[PetroBook] Sync resume failed:',e.message||e); }
+      }
+      // 4. ALWAYS register onAuthStateChanged — handles both returning users
+      //    (fast flush path) and fresh devices (full _pbHandleFirebaseUser restore).
+      if(true){ // was: if(localStorage.getItem('pb-sync-active')==='1')
+        try{
+          // (removed duplicate SyncEngine activation — now done above or in _pbFinaliseRestore)
+          // 4. Init PB_FirestoreWriter once Firebase Auth resolves the user's accountId.
+          //    accountId is read from the JWT custom claim (set by Admin SDK on first deployment).
+          //    Falls back to fbUser.uid for the super_owner case.
+          if(typeof PB_FirebaseAuth !== 'undefined' && typeof PB_FirestoreWriter !== 'undefined'){
+            PB_FirebaseAuth.onAuthStateChanged(function(fbUser){
+              if(!fbUser || PB_FirestoreWriter.isReady()) return;
+              console.info('[PetroBook] AUTH_UID='+fbUser.uid);
+              var fsDb = firebase.firestore();
+
+              // SaaS Phase 1: resolve writer root ID in priority order:
+              //   1. pb-company-id cache (set during setup/login on this device)
+              //   2. userProfiles/{uid} in Firestore (cross-device key)
+              //   3. JWT claims.accountId (legacy — still works for existing accounts)
+              //   4. fbUser.uid fallback (last resort)
+              var cachedCid = _pbGetCompanyId();
+              if(cachedCid){
+                // Fast path: company ID already known from this device's login/setup
+                if(typeof PB_FIRESTORE_PATHS !== 'undefined') PB_FIRESTORE_PATHS.useCompanies();
+                if(PB_FirestoreWriter.init(fsDb, cachedCid)){
+                  console.info('[SYNC] PB_FirestoreWriter initialised from cache. companyId:', cachedCid);
+                  PB_FirestoreWriter.flush().catch(function(){});
+                  if(typeof PB_QueueReplayEngine !== 'undefined'){
+                    // Clean poison dead entries before replay
+                    PB_QueueReplayEngine.cleanDeadWriteQueue();
+                    var _qBefore = (typeof QueueManager !== 'undefined') ? QueueManager.getPendingOperations().length : -1;
+                    console.log('[QUEUE RECOVERY] pending_before=' + _qBefore);
+                    PB_QueueReplayEngine.replayAll(PB_FirestoreWriter).then(function(r){
+                      var _qAfter = (typeof QueueManager !== 'undefined') ? QueueManager.getPendingOperations().length : -1;
+                      console.log('[QUEUE RECOVERY] pending_after=' + _qAfter + ' replayed=' + (r&&r.replayed||0) + ' dead=' + (r&&r.dead||0));
+                      console.log('[RECOVERY RESULT] dead=' + (r&&r.dead||0) + ' pending=' + _qAfter + ' confirmed=' + (r&&r.replayed||0));
+                    }).catch(function(){});
+                  }
+                }
+                return;
+              }
+
+              // Slow path: look up via userProfiles or JWT claims
+              fbUser.getIdTokenResult(true).then(function(tokenResult){
+                var claims = tokenResult.claims||{};
+                console.info('[AUTH] TOKEN_CLAIMS='+JSON.stringify(claims));
+                var role = claims.role||'(no claim)';
+                var pumpId = claims.pumpId||'(none)';
+
+                // Try userProfiles/{uid} first
+                return fsDb.doc('userProfiles/'+fbUser.uid).get().then(function(profDoc){
+                  var rootId, useCompaniesPrefix;
+                  if(profDoc.exists && profDoc.data().companyId){
+                    rootId = profDoc.data().companyId;
+                    useCompaniesPrefix = true;
+                    _pbSetCompanyId(rootId); // cache for future fast-path
+                    console.info('[PetroBook] PB_FirestoreWriter rootId from userProfile:', rootId);
+                  } else {
+                    // Fall back to JWT claims (legacy accounts/ path)
+                    rootId = claims.accountId || fbUser.uid;
+                    useCompaniesPrefix = false;
+                    console.info('[PetroBook] PB_FirestoreWriter rootId from claims:', rootId);
+                  }
+                  if(typeof PB_FIRESTORE_PATHS !== 'undefined'){
+                    useCompaniesPrefix ? PB_FIRESTORE_PATHS.useCompanies() : PB_FIRESTORE_PATHS.useAccounts();
+                  }
+                  console.info('[PetroBook] ACCOUNT_ID='+rootId+' ROLE='+role+' PUMP_ID='+pumpId);
+                  if(PB_FirestoreWriter.init(fsDb, rootId)){
+                    console.info('[PetroBook] PB_FirestoreWriter initialised. rootId:', rootId);
+                    PB_FirestoreWriter.flush().catch(function(){});
+                    if(typeof PB_QueueReplayEngine !== 'undefined'){
+                      // Clean poison dead entries before replay
+                      PB_QueueReplayEngine.cleanDeadWriteQueue();
+                      var _qBefore2 = (typeof QueueManager !== 'undefined') ? QueueManager.getPendingOperations().length : -1;
+                      console.log('[QUEUE RECOVERY] pending_before=' + _qBefore2);
+                      PB_QueueReplayEngine.replayAll(PB_FirestoreWriter).then(function(r){
+                        var _qAfter2 = (typeof QueueManager !== 'undefined') ? QueueManager.getPendingOperations().length : -1;
+                        console.log('[QUEUE RECOVERY] pending_after=' + _qAfter2 + ' replayed=' + (r&&r.replayed||0) + ' dead=' + (r&&r.dead||0));
+                        console.log('[RECOVERY RESULT] dead=' + (r&&r.dead||0) + ' pending=' + _qAfter2 + ' confirmed=' + (r&&r.replayed||0));
+                      }).catch(function(){});
+                    }
+                  }
+                }).catch(function(profileErr){
+                  // userProfile read failed — fall back to JWT claims
+                  var aid = claims.accountId || fbUser.uid;
+                  console.warn('[PetroBook] userProfile read failed, using claims.accountId:', profileErr.message||profileErr);
+                  if(PB_FirestoreWriter.init(fsDb, aid)){
+                    PB_FirestoreWriter.flush().catch(function(){});
+                  }
+                });
+              }).catch(function(e){
+                // No custom claims — use Firebase UID directly
+                PB_FirestoreWriter.init(fsDb, fbUser.uid);
+                console.warn('[PetroBook] Auth claims unavailable, using fbUser.uid as accountId:', e);
+                PB_FirestoreWriter.flush().catch(function(){});
+              });
+            });
+          }
+          // 5. Wire online reconnect handler to flush queued offline writes
+          window.addEventListener('online', function(){
+            if(typeof SyncEngine !== 'undefined' && SyncEngine.ACTIVE){
+              SyncEngine.replayQueue();
+            }
+          }, { passive: true, once: false });
+          console.info('[PetroBook] Firebase sync resumed from persistent flag.');
+        }catch(e){ console.warn('[PetroBook] Sync restore failed:', e); }
+      }
+    }
+  }catch(e){ console.warn('[PetroBook] Firebase startup failed — using localStorage:', e.message||e); }
+}
+
+(function boot(){
+  try{
+    _pbInitStorage();
+    if(GCFG.pinLock&&GCFG.pin)showPinLock();
+  }catch(e){
+    console.error('[PetroBook Boot]', e.message||e);
+  }
+})();
+
+// ── ROLE ROUTING — runs after all init/paint handlers ──
+window.addEventListener('load', function(){
+  setTimeout(function(){
+    try{ getPumps(); }catch(e){}
+
+    // ── Step 1: Check session expiry ──────────────────────────────────────
+    // Phase 3C: Future async version of this router:
+    //   const ctx = await _pbAuthReady();
+    //   if(_isSessionExpiredFrom(ctx)) { ... }
+    // For now: sync reads are used directly.
+    if(typeof _isSessionExpired === 'function' && _isSessionExpired()){
+      console.info('[PetroBook] SETUP_TRIGGER_REASON=session_expired');
+      try{ _clearSession(); }catch(e){}
+      try{ showRoleLogin(); }catch(e){ console.error('[PetroBook login]',e); }
+      return;
+    }
+
+    // ── Step 2: Get role from stored session ──────────────────────────────
+    const role = getRole();
+
+    // ── Step 3: No session at all → show login ────────────────────────────
+    if(!role){
+      console.info('[PetroBook] SETUP_TRIGGER_REASON=no_role_in_localstorage — new device or cleared storage');
+      try{ showRoleLogin(); }catch(e){ console.error('[PetroBook login]',e); }
+      return;
+    }
+
+    // ── Step 4: Valid session exists — check if PIN is required ───────────
+    // A returning user with a PIN must enter it even if their session hasn't
+    // technically expired. PIN is required on every fresh app open.
+    try{
+      const sess = (typeof _getSession === 'function') ? _getSession() : null;
+      const userId = sess ? sess.userId : null;
+      const pinHash = userId && (typeof _loadPinHash === 'function') ? _loadPinHash(userId) : null;
+
+      if(pinHash && userId){
+        // User has a PIN set — show PIN screen instead of entering app silently
+        const user = (typeof _getUserById === 'function') ? _getUserById(userId) : null;
+        if(user && user.status !== 'inactive'){
+          _pinUserId = userId;
+          if(typeof _showPinScreen === 'function') _showPinScreen(user);
+          if(typeof showRoleLogin === 'function'){
+            const loginEl = document.getElementById('pb-login');
+            if(loginEl) loginEl.classList.add('open');
+          }
+          if(typeof _authWaveInit === 'function') _authWaveInit();
+          return;
+        }
+      }
+    }catch(e){ console.error('[PetroBook PIN check]', e); }
+
+    // ── Step 5: Valid session, no PIN set → enter app directly ────────────
+    if(role === 'manager'){
+      try{ enterManagerMode(getManagerPump()); }
+      catch(e){ console.error('[PetroBook enterManager]', e); }
+    } else {
+      try{ enterOwnerMode(); }
+      catch(e){ console.error('[PetroBook enterOwner]', e); }
+    }
+  }, 120);
+});
+
+
+
+// ══════════════════════════════════════════════════════════
+// ICON RENDERER — inline SVG from data-lucide attributes
+// ══════════════════════════════════════════════════════════
+// ── SELF-CONTAINED ICON ENGINE (no CDN) ──────────────────────────────────────
+// All 38 icons used in this app, inlined as SVG path data.
+const _IC = {
+  'fuel':           ['M3 3h12l1 3H3z','M3 6h13l2 6H2z','M3 12h14v8a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z','M8 14v5','M5 15v4','M15 15v4','M6 3V1h2v2z','M14 3V1h2v2z'],
+  'banknote':       ['M2 7a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2z','M12 12m-2 0a2 2 0 1 0 4 0 2 2 0 0 0-4 0','M6 10h.01','M18 10h.01'],
+  'landmark':       ['M3 22V12','M21 22V12','M12 22V12','M12 2 2 7h20z','M5 12h14'],
+  'credit-card':    ['M2 7a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2z','M2 11h20','M7 16h2','M11 16h2'],
+  'gauge':          ['M12 12m-1 0a1 1 0 1 0 2 0 1 1 0 0 0-2 0','M12 2a10 10 0 1 0 0 20A10 10 0 0 0 12 2z','M12 12L9 9'],
+  'package':        ['M16.5 9.4 7.55 4.24','M3 6l9 5.25L21 6','M12 22V11.25','M21 6v12a2 2 0 0 1-1 1.73l-8 4a2 2 0 0 1-2 0l-8-4A2 2 0 0 1 3 18V6l8-4a2 2 0 0 1 2 0z'],
+  'receipt':        ['M4 2h16a1 1 0 0 1 1 1v18l-3-2-2 2-2-2-2 2-2-2-3 2V3a1 1 0 0 1 1-1z','M8 8h8','M8 12h8','M8 16h5'],
+  'history':        ['M3 3v5h5','M3.05 13A9 9 0 1 0 6 5.3L3 8','M12 7v5l4 2'],
+  'settings':       ['M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z','M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z'],
+  'home':           ['M3 12 12 3l9 9','M5 10v9a1 1 0 0 0 1 1h4v-4h4v4h4a1 1 0 0 0 1-1v-9'],
+  'save':           ['M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z','M17 21v-8H7v8','M7 3v5h8'],
+  'layers':         ['M12 2 2 7l10 5 10-5-10-5z','M2 17l10 5 10-5','M2 12l10 5 10-5'],
+  'users':          ['M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2','M9 11m-4 0a4 4 0 1 0 8 0 4 4 0 0 0-8 0','M22 21v-2a4 4 0 0 0-3-3.87','M16 3.13a4 4 0 0 1 0 7.75'],
+  'user':           ['M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2','M12 7m-4 0a4 4 0 1 0 8 0 4 4 0 0 0-8 0'],
+  'log-out':        ['M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4','M16 17l5-5-5-5','M21 12H9'],
+  'moon':           ['M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z'],
+  'sun':            ['M12 12m-4 0a4 4 0 1 0 8 0 4 4 0 0 0-8 0','M12 2v2','M12 20v2','M4.22 4.22l1.42 1.42','M18.36 18.36l1.42 1.42','M2 12h2','M20 12h2','M4.22 19.78l1.42-1.42','M18.36 5.64l1.42-1.42'],
+  'sun-moon':       ['M12 8a4 4 0 1 1-4 4','M12 2v2','M12 8V4','M20 8.5A8.5 8.5 0 1 1 6.5 20'],
+  'chevron-right':  ['M9 18l6-6-6-6'],
+  'chevron-left':   ['M15 18l-6-6 6-6'],
+  'trending-up':    ['M23 6l-9.5 9.5-5-5L1 18','M17 6h6v6'],
+  'check':          ['M20 6 9 17l-5-5'],
+  'check-circle':   ['M22 11.08V12a10 10 0 1 1-5.93-9.14','M22 4 12 14.01l-3-3'],
+  'x':              ['M18 6 6 18','M6 6l12 12'],
+  'plus':           ['M12 5v14','M5 12h14'],
+  'lock':           ['M19 11H5a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7a2 2 0 0 0-2-2z','M7 11V7a5 5 0 0 1 10 0v4'],
+  'unlock':         ['M19 11H5a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7a2 2 0 0 0-2-2z','M7 11V7a5 5 0 0 1 9.9-1'],
+  'key':            ['M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3m-3.5 3.5L19 4'],
+  'pencil':         ['M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z'],
+  'share-2':        ['M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8','M16 6l-4-4-4 4','M12 2v13'],
+  'message-circle': ['M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8z'],
+  'copy':           ['M20 9h-9a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2v-9a2 2 0 0 0-2-2z','M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1'],
+  'download':       ['M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4','M7 10l5 5 5-5','M12 15V3'],
+  'database':       ['M12 2C8.13 2 5 3.34 5 5v14c0 1.66 3.13 3 7 3s7-1.34 7-3V5c0-1.66-3.13-3-7-3z','M5 5c0 1.66 3.13 3 7 3s7-1.34 7-3','M5 12c0 1.66 3.13 3 7 3s7-1.34 7-3'],
+  'rotate-ccw':     ['M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8','M3 3v5h5'],
+  'arrow-right-left':['M17 3l4 4-4 4','M3 7h18','M7 21l-4-4 4-4','M21 17H3'],
+  'clipboard-list': ['M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2','M9 2h6a1 1 0 0 1 1 1v2a1 1 0 0 1-1 1H9a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1z','M9 12h6','M9 16h4'],
+  'smartphone':     ['M17 2H7a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2z','M12 18h.01'],
+  'sparkles':       ['M12 3l1.5 4.5L18 9l-4.5 1.5L12 15l-1.5-4.5L6 9l4.5-1.5z','M5 3l.75 2.25L8 6l-2.25.75L5 9l-.75-2.25L2 6l2.25-.75z','M19 15l.75 2.25L22 18l-2.25.75L19 21l-.75-2.25L16 18l2.25-.75z'],
+  'volume-2':       ['M11 5 6 9H2v6h4l5 4V5z','M19.07 4.93a10 10 0 0 1 0 14.14','M15.54 8.46a5 5 0 0 1 0 7.07'],
+  'trending-down':  ['M22 17l-8.5-8.5-5 5L2 7','M16 17h6','M22 11v6'],
+  'triangle-alert': ['M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z','M12 9v4','M12 17h.01'],
+  'hand-coins':     ['M11 15h2a2 2 0 1 0 0-4h-3c-.6 0-1.1.2-1.4.6L3 17','M3 17l3 3 7-3.5','M16 6a4 4 0 0 1 0 8'],
+  'arrow-left':     ['M19 12H5','M12 19l-7-7 7-7'],
+  'circle-check-big':['M22 11.08V12a10 10 0 1 1-5.93-9.14','M22 4 12 14.01l-3-3'],
+  'activity':       ['M22 12h-4l-3 9L9 3l-3 9H2'],
+  'layout-dashboard':['M3 3h7v7H3z','M14 3h7v7h-7z','M3 14h7v7H3z','M14 14h7v7h-7z'],
+};
+
+// Build a single SVG element for the given icon name
+function _buildSVG(name, wPx, hPx, extraStyle) {
+  const paths = _IC[name];
+  if (!paths) return null;
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('fill', 'none');
+  svg.setAttribute('stroke', 'currentColor');
+  svg.setAttribute('stroke-width', '2');
+  svg.setAttribute('stroke-linecap', 'round');
+  svg.setAttribute('stroke-linejoin', 'round');
+  svg.setAttribute('aria-hidden', 'true');
+  const s = 'width:' + (wPx||'1em') + ';height:' + (hPx||'1em') +
+            ';vertical-align:middle;flex-shrink:0;display:inline-block' +
+            (extraStyle ? ';' + extraStyle : '');
+  svg.setAttribute('style', s);
+  paths.forEach(function(d) {
+    const p = document.createElementNS(ns, 'path');
+    p.setAttribute('d', d);
+    svg.appendChild(p);
+  });
+  return svg;
+}
+
+// Replace every <i data-lucide="name"> inside the given roots with inline SVG
+function lIcons(opts) {
+  const roots = (opts && opts.nodes) ? (Array.isArray(opts.nodes) ? opts.nodes : [opts.nodes]) : [document.body];
+  roots.forEach(function(root) {
+    if (!root) return;
+    // querySelectorAll on an SVG node throws, skip it
+    try {
+      const els = root.querySelectorAll('i[data-lucide]');
+      els.forEach(function(el) {
+        const name = el.getAttribute('data-lucide');
+        const style = el.getAttribute('style') || '';
+        // Parse explicit px dimensions if provided
+        const wm = style.match(/width\s*:\s*([\d.]+)px/);
+        const hm = style.match(/height\s*:\s*([\d.]+)px/);
+        const w = wm ? wm[1] + 'px' : '1em';
+        const h = hm ? hm[1] + 'px' : '1em';
+        // Preserve opacity / color etc. (strip dimension rules)
+        const extra = style
+          .replace(/width\s*:[^;]+;?/g, '')
+          .replace(/height\s*:[^;]+;?/g, '')
+          .replace(/;\s*$/, '').trim();
+        const svg = _buildSVG(name, w, h, extra);
+        if (svg && el.parentNode) el.parentNode.replaceChild(svg, el);
+      });
+    } catch(e) {}
+  });
+}
+
+// Initial paint — handled by DOMContentLoaded in the main script block above.
+// lIcons and refreshDashboard are all called there, after
+// all state variables (stockData, readings, CFG etc.) are fully initialised.
+
+// ═══════════════════════════════════════════════════
+// PREMIUM UI ENHANCEMENTS — Al-Manar Station v1.0
+// Smart insights · Status chip · Enhanced toast
+// ═══════════════════════════════════════════════════
+
+// ── Dropdown / select validation helpers ──────────────────────────────────────
+/**
+ * markSelError(el) — adds .sel-error class, removes it on next change
+ */
+window.markSelError = function(el) {
+  if (!el) return;
+  el.classList.add('sel-error');
+  var _remove = function() {
+    el.classList.remove('sel-error');
+    el.removeEventListener('change', _remove);
+    el.removeEventListener('input', _remove);
+    el.removeEventListener('focus', _remove);
+  };
+  el.addEventListener('change', _remove);
+  el.addEventListener('input', _remove);
+  el.addEventListener('focus', _remove);
+};
+
+/**
+ * validateSelects(containerEl) — marks all empty required selects in a container.
+ * Returns true if all pass, false if any fail.
+ */
+window.validateSelects = function(containerEl) {
+  var selects = (containerEl || document).querySelectorAll('select[required], .pb-sel[required]');
+  var valid = true;
+  selects.forEach(function(s) {
+    if (!s.value || s.value === '') {
+      window.markSelError(s);
+      valid = false;
+    }
+  });
+  return valid;
+};
+
+// ── Mobile Safari — prevent sheet from jumping when native select opens ──────
+(function() {
+  document.addEventListener('focusin', function(e) {
+    if (e.target && e.target.tagName === 'SELECT') {
+      var sheet = e.target.closest('.sheet, .ovl, [class*="sheet"]');
+      if (sheet) {
+        var savedScrollTop = sheet.scrollTop;
+        requestAnimationFrame(function() {
+          if (sheet.scrollTop !== savedScrollTop) {
+            sheet.scrollTop = savedScrollTop;
+          }
+        });
+      }
+    }
+  }, true);
+})();
+
+// ── Smart Insights Engine ────────────────────────────────────────────────────
+function refreshInsights() {
+  const bar = document.getElementById('insight-bar');
+  if (!bar) return;
+  const chips = [];
+  const hist = StorageService.loadFuelHistory();
+  const today = _localDateStr();
+  const _yd=new Date();_yd.setDate(_yd.getDate()-1);
+  const yesterday = _localDateStr(_yd);
+  const yestRec = hist.find(r => r.date === yesterday);
+
+  // Trend vs yesterday
+  if (yestRec) {
+    const todaySale = (typeof getTotalSale === 'function') ? getTotalSale() : 0;
+    const yestSale  = yestRec.totalSale || 0;
+    if (yestSale > 0 && todaySale > 0) {
+      const pct = ((todaySale - yestSale) / yestSale * 100).toFixed(0);
+      const up  = pct >= 0;
+      chips.push({
+        dot: up ? '#10b981' : '#ef4444',
+        label: 'vs Yesterday',
+        val: (up ? '+' : '') + pct + '%',
+        color: up ? '#059669' : '#dc2626',
+      });
+    }
+  }
+
+  // Low stock alert
+  if (typeof stockData !== 'undefined' && typeof CFG !== 'undefined') {
+    ['g','r','d'].forEach(function(f) {
+      const stk = stockData[f] || {};
+      const closing = parseFloat(stk.closing) || 0;
+      const cap = parseInt((CFG.openStock || {})[f] || 0) || 0;
+      if (closing > 0 && closing < (CFG.lowStock || 5000)) {
+        const fName = f === 'g' ? '91' : f === 'r' ? '95' : 'DSL';
+        chips.push({ dot: '#f59e0b', label: fName + ' Low Stock', val: closing + ' L', color: '#d97706' });
+      }
+    });
+  }
+
+  // Expense ratio
+  if (typeof getTotalSale === 'function' && typeof getTotalExp === 'function') {
+    try {
+      const sale = getTotalSale();
+      const exp  = getTotalExp();
+      if (sale > 0 && exp > 0) {
+        const ratio = (exp / sale * 100).toFixed(0);
+        chips.push({ dot: '#f97316', label: PB18n.t('misc.expense_ratio'), val: ratio + '%', color: '#ea580c' });
+      }
+    } catch(e) {}
+  }
+
+  if (!chips.length) { bar.style.display = 'none'; return; }
+  bar.style.display = 'flex';
+  bar.innerHTML = chips.map(function(c) {
+    return '<div class="insight-chip">' +
+      '<span class="insight-chip-dot" style="background:' + c.dot + '"></span>' +
+      c.label +
+      '<span class="insight-chip-val" style="color:' + c.color + '">' + c.val + '</span>' +
+      '</div>';
+  }).join('');
+}
+
+// ── Status Chip ──────────────────────────────────────────────────────────────
+function refreshStatusChip() {
+  const chip  = document.getElementById('hdr-status-chip');
+  const label = document.getElementById('hdr-status-text');
+  if (!chip || !label) return;
+  const today = _localDateStr();
+  const hist  = StorageService.loadFuelHistory();
+  const committed = hist.some(function(r) { return r.date === today; });
+  if (committed) {
+    chip.style.background  = 'rgba(79,70,229,.10)';
+    chip.style.borderColor = 'rgba(79,70,229,.22)';
+    chip.style.color       = '#4f46e5';
+    chip.querySelector('.hdr-status-dot').style.background = '#4f46e5';
+    label.textContent = PB18n.t('misc.synced');
+  } else {
+    chip.style.background  = 'rgba(16,185,129,.09)';
+    chip.style.borderColor = 'rgba(16,185,129,.22)';
+    chip.style.color       = '#059669';
+    chip.querySelector('.hdr-status-dot').style.background = '#22c55e';
+    label.textContent = PB18n.t('hdr.status.open');
+  }
+}
+
+// ── Post-dashboard-refresh hook ───────────────────────────────────────────────
+const _origRefreshDash = window.refreshDashboard;
+if (typeof _origRefreshDash === 'function') {
+  window.refreshDashboard = function() {
+    _origRefreshDash.apply(this, arguments);
+    try { refreshStatusChip(); } catch(e) {}
+    try { refreshInsights();   } catch(e) {}
+    try { if(typeof writeSnapshot==='function') writeSnapshot(); } catch(e) {}
+  };
+}
+
+// Initial calls on load
+document.addEventListener('DOMContentLoaded', function() {
+  setTimeout(function() {
+    try { refreshStatusChip(); } catch(e) {}
+    try { refreshInsights();   } catch(e) {}
+  }, 700);
+});
+
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   DAILY ENTRY ENHANCEMENTS — simple, fast, operational
+   • Auto carry-forward (nozzle closings + stock → next day openings)
+   • Lightweight auto-save (session, debounced 2 s)
+   • Save summary popup (compact before save)
+   • Simple nozzle validation (closing < opening)
+   ══════════════════════════════════════════════════════════════════════════════ */
+
+/* ── Auto-save debounce ─────────────────────────────────────────────────── */
+var _autoSaveT = null;
+function _triggerAutoSave() {
+  clearTimeout(_autoSaveT);
+  _autoSaveT = setTimeout(function () {
+    try { if (typeof saveSession === 'function') saveSession(); } catch(e) {}
+  }, 2000);
+}
+
+/* ── Record page date bar ─────────────────────────────────────────────── */
+function refreshRecordBar() {
+  try {
+    var today = new Date();
+    var ds = document.getElementById('rec-date-str');
+    if (ds) ds.textContent = today.toLocaleDateString('en-GB',
+      {weekday:'short', day:'numeric', month:'short', year:'numeric'});
+
+    // Progress: count completed fuel readings + stocks (max 6)
+    var done = 0;
+    ['g','r','d'].forEach(function(f) {
+      var hr = false;
+      try { for (var n=1;n<=4;n++) { if ((readings[f][n].liters||0)>0){hr=true;break;} } } catch(e){}
+      if (hr) done++;
+      try { if (stockData[f].open != null) done++; } catch(e) {}
+    });
+    var pg = document.getElementById('rec-date-prog');
+    if (pg) pg.textContent = done + '/6';
+  } catch(e) {}
+}
+
+/* ── Carry-forward display ────────────────────────────────────────────── */
+function refreshCarryBanner() {
+  try {
+    var banner = document.getElementById('rec-cf-banner');
+    var cfDate = (typeof _cfBannerDate !== 'undefined') ? _cfBannerDate : null;
+    if (!banner || !cfDate) { if (banner) banner.style.display = 'none'; return; }
+
+    var hist = (typeof loadHistory === 'function') ? loadHistory() : {};
+    var yRec = hist[cfDate];
+    if (!yRec) { banner.style.display = 'none'; return; }
+
+    banner.style.display = '';
+    var cl = yRec.closings || {};
+    var parts = [];
+    var FNAME = { g:'91', r:'95', d:'DSL' };
+    ['g','r','d'].forEach(function(f) {
+      var maxM = null;
+      for (var n=1;n<=4;n++) { var v=cl.meter?.[f]?.[n]; if(v!=null&&(maxM===null||v>maxM)) maxM=v; }
+      if (maxM !== null) parts.push(FNAME[f]+' meter: '+maxM.toLocaleString());
+      var sv = cl.stock?.[f];
+      if (sv != null) parts.push(FNAME[f]+' stock: '+Math.round(sv).toLocaleString()+' L');
+    });
+    var val = document.getElementById('rec-cf-val');
+    if (val) val.textContent = parts.slice(0,4).join(' · ');
+  } catch(e) {}
+}
+
+/* ── Lightweight nozzle validation ───────────────────────────────────── */
+function _quickValidate() {
+  var errs = [];
+  var FNAME = { get g(){return PB18n.t('fuel.91')}, get r(){return PB18n.t('fuel.95')}, get d(){return PB18n.t('fuel.dsl')} };
+  ['g','r','d'].forEach(function(f) {
+    for (var n=1;n<=4;n++) {
+      try {
+        var r = readings[f][n];
+        if (r.open != null && r.close != null && r.close < r.open) {
+          errs.push(FNAME[f]+' Nozzle '+n+': closing ('+r.close+') < opening ('+r.open+')');
+        }
+      } catch(e) {}
+    }
+  });
+  return errs;
+}
+
+/* ── Save summary popup ───────────────────────────────────────────────── */
+function openSaveSummary() {
+  try {
+    var today = new Date();
+    var dateStr = today.toLocaleDateString('en-GB',
+      {weekday:'long', day:'numeric', month:'long', year:'numeric'});
+    var el = document.getElementById('ss-date');
+    if (el) el.textContent = dateStr;
+    var title = document.getElementById('ss-title');
+    if (title) title.textContent = PB18n.t('rec.save_report');
+
+    var tA   = (typeof getTotalSale === 'function') ? getTotalSale() : 0;
+    var card = (typeof getTotalCard === 'function') ? getTotalCard() : 0;
+    var exp  = (typeof getTotalExp  === 'function') ? getTotalExp()  : 0;
+    var cih  = tA - card - exp;
+    var FNAME = { get g(){return PB18n.t('fuel.91')}, get r(){return PB18n.t('fuel.95')}, get d(){return PB18n.t('fuel.dsl')} };
+    var fmt  = function(n) { return sar(n); };
+
+    // Validation warnings
+    var errs = _quickValidate();
+    var warnEl = document.getElementById('ss-warnings');
+    if (warnEl) {
+      warnEl.innerHTML = errs.map(function(e) {
+        return '<div class="ss-warn-item">⚠️ ' + e + '</div>';
+      }).join('');
+    }
+
+    // Fuel rows
+    var fuelEl = document.getElementById('ss-fuel-rows');
+    if (fuelEl) {
+      var html = '';
+      ['g','r','d'].forEach(function(f) {
+        var L = 0, S = 0;
+        try { for (var n=1;n<=4;n++){L+=(readings[f][n].liters||0);S+=(readings[f][n].total||0);} } catch(e){}
+        if (L > 0) {
+          html += '<div class="ss-row">'
+               + '<span class="ss-row-name">' + FNAME[f] + '</span>'
+               + '<span class="ss-row-val">' + Math.round(L).toLocaleString() + ' L &nbsp;·&nbsp; ' + fmt(S) + '</span>'
+               + '</div>';
+        }
+      });
+      fuelEl.innerHTML = html || '<div class="ss-row"><span class="ss-row-name" style="color:#94a3b8">'+PB18n.t('misc.no_readings_yet')+'</span></div>';
+    }
+
+    // Financial rows
+    var finEl = document.getElementById('ss-fin-rows');
+    if (finEl) {
+      var cashConf = (typeof totalCashConfirmed !== 'undefined' && totalCashConfirmed != null) ? totalCashConfirmed : null;
+      var bankConf = (typeof totalBankConfirmed !== 'undefined' && totalBankConfirmed != null) ? totalBankConfirmed : null;
+      finEl.innerHTML =
+        '<div class="ss-row"><span class="ss-row-name">'+PB18n.t('rec.total_sale')+'</span><span class="ss-row-val pos">' + fmt(tA) + '</span></div>'
+      + (card > 0 ? '<div class="ss-row"><span class="ss-row-name">Card / Bank</span><span class="ss-row-val">' + fmt(card) + '</span></div>' : '')
+      + (exp  > 0 ? '<div class="ss-row"><span class="ss-row-name">Expenses</span><span class="ss-row-val neg">−' + fmt(exp) + '</span></div>' : '')
+      + '<div class="ss-row"><span class="ss-row-name">Cash in Hand</span><span class="ss-row-val ' + (cih>=0?'pos':'neg') + '">' + fmt(cih) + '</span></div>'
+      + (cashConf !== null ? '<div class="ss-row"><span class="ss-row-name">Total Cash</span><span class="ss-row-val pos">' + fmt(cashConf) + '</span></div>' : '')
+      + (bankConf !== null ? '<div class="ss-row"><span class="ss-row-name">Total Bank</span><span class="ss-row-val pos">' + fmt(bankConf) + '</span></div>' : '');
+    }
+
+    // Grand total
+    var sg = (typeof getStockValue === 'function') ? (getStockValue('g')||0) : 0;
+    var sr = (typeof getStockValue === 'function') ? (getStockValue('r')||0) : 0;
+    var sd = (typeof getStockValue === 'function') ? (getStockValue('d')||0) : 0;
+    var grand = sg + sr + sd + (typeof totalCashConfirmed!=='undefined'&&totalCashConfirmed!=null?totalCashConfirmed:0)
+                             + (typeof totalBankConfirmed!=='undefined'&&totalBankConfirmed!=null?totalBankConfirmed:0);
+    var grandEl = document.getElementById('ss-grand');
+    if (grandEl) {
+      grandEl.innerHTML = grand > 0
+        ? '<div class="ss-grand"><span class="ss-grand-lbl">GRAND TOTAL</span><span class="ss-grand-val">' + sar(grand) + '</span></div>'
+        : '';
+    }
+
+    document.getElementById('ov-save-summary').classList.add('open');
+    if (typeof vibe === 'function') vibe(8);
+  } catch(e) {
+    console.warn('[openSaveSummary]', e);
+    // Fallback: save directly if popup fails
+    if (typeof doSave === 'function') doSave();
+  }
+}
+
+function closeSaveSummary() {
+  var el = document.getElementById('ov-save-summary');
+  if (el) el.classList.remove('open');
+}
+
+function doSaveConfirmed() {
+  closeSaveSummary();
+  if (typeof doSave === 'function') doSave();
+  // After save, show next-day ready prompt
+  setTimeout(function () {
+    try { _showNextDayPrompt(); } catch(e) {}
+  }, 600);
+  refreshRecordBar();
+}
+
+/* ── Next-day prompt ─────────────────────────────────────────────────── */
+function _showNextDayPrompt() {
+  // Build carry-forward chips from today's closings
+  try {
+    var hist = (typeof loadHistory === 'function') ? loadHistory() : {};
+    var key  = (typeof getTodayKey === 'function') ? getTodayKey() : new Date().toISOString().slice(0,10);
+    var rec  = hist[key];
+    var chips = [];
+    var FNAME = { g:'91', r:'95', d:'DSL' };
+    if (rec && rec.closings) {
+      var cl = rec.closings;
+      ['g','r','d'].forEach(function(f) {
+        // Max nozzle closing
+        var maxM = null;
+        for (var n=1;n<=4;n++) { var v=cl.meter?.[f]?.[n]; if(v!=null&&(maxM===null||v>maxM)) maxM=v; }
+        if (maxM != null) chips.push(FNAME[f]+' meter: '+maxM.toLocaleString());
+        if (cl.stock?.[f] != null) chips.push(FNAME[f]+' stock: '+Math.round(cl.stock[f]).toLocaleString()+' L');
+      });
+    }
+    var carries = document.getElementById('nd-carries');
+    if (carries) {
+      carries.innerHTML = chips.slice(0,6).map(function(c) {
+        return '<span class="nd-chip">'+c+'</span>';
+      }).join('');
+    }
+    var sub = document.getElementById('nd-sub');
+    if (sub) sub.textContent = chips.length
+      ? 'Opening values for tomorrow have been prepared.'
+      : 'Today\'s report is saved.';
+  } catch(e) {}
+
+  var el = document.getElementById('ov-next-day');
+  if (el) el.classList.add('open');
+  if (typeof vibe === 'function') vibe([10,8,15]);
+}
+
+function closeNextDay() {
+  var el = document.getElementById('ov-next-day');
+  if (el) el.classList.remove('open');
+}
+
+/**
+ * Clears today's session and applies today's closings as tomorrow's openings.
+ * Called when user taps "Start Tomorrow's Entry".
+ */
+function startTomorrow() {
+  closeNextDay();
+  try {
+    // 1. Apply today's closings to CFG as tomorrow's openings
+    var hist = (typeof loadHistory === 'function') ? loadHistory() : {};
+    var key  = (typeof getTodayKey === 'function') ? getTodayKey() : new Date().toISOString().slice(0,10);
+    var rec  = hist[key];
+    if (rec && rec.closings) {
+      var cl = rec.closings;
+      CFG.openMeter = CFG.openMeter || {};
+      ['g','r','d'].forEach(function(f) {
+        CFG.openMeter[f] = CFG.openMeter[f] || {};
+        for (var n=1;n<=4;n++) {
+          var v = cl.meter?.[f]?.[n];
+          if (v != null) CFG.openMeter[f][n] = v;
+        }
+        if (cl.stock?.[f] != null) {
+          CFG.openStock = CFG.openStock || {};
+          CFG.openStock[f] = cl.stock[f];
+        }
+      });
+      if (cl.cash != null) CFG.openCash = cl.cash;
+      if (cl.bank != null) CFG.openBank = cl.bank;
+      if (typeof persistCFG === 'function') persistCFG();
+    }
+
+    // 2. Clear all today's in-memory data
+    ['g','r','d'].forEach(function(f) {
+      for (var n=1;n<=4;n++) readings[f][n] = {};
+      stockData[f] = { open: null, add: 0, entries: [] };
+    });
+    expItems=[]; cardItems=[]; tcItems=[]; tbItems=[]; smEntries=[];
+    totalCashConfirmed=null; totalBankConfirmed=null;
+
+    // 3. Apply openings from CFG so nozzle opening fields are pre-filled
+    if (typeof applyOpeningsFromCFG === 'function') {
+      // Temporarily clear the banner date guard so openings apply
+      _cfBannerDate = null;
+      applyOpeningsFromCFG();
+    }
+
+    // 4. Save clean session
+    if (typeof saveSession === 'function') saveSession();
+
+    // 5. Refresh UI
+    if (typeof refreshAllFinancials === 'function') refreshAllFinancials();
+    if (typeof refreshDashboard === 'function') refreshDashboard();
+    ['g','r','d'].forEach(function(f) {
+      try { refreshTankCard(f); } catch(e2) {}
+    });
+    refreshRecordBar();
+
+    // Show a brief carry-forward banner
+    refreshCarryBanner();
+    document.getElementById('rec-cf-banner').style.display = '';
+
+    if (typeof showToast === 'function') showToast('Ready for tomorrow ✓');
+    if (typeof sndConfirm === 'function') sndConfirm();
+    if (typeof vibe === 'function') vibe([15,10,20]);
+  } catch(e) {
+    console.error('[startTomorrow]', e);
+    if (typeof showToast === 'function') showToast('Could not prepare — please reload');
+  }
+}
+
+/* ── Hook auto-save into key actions ─────────────────────────────────── */
+(function () {
+  // Wrap saveAllReadings
+  var _origSAR = window.saveAllReadings;
+  if (typeof _origSAR === 'function') {
+    window.saveAllReadings = function () {
+      _origSAR.apply(this, arguments);
+      try { _triggerAutoSave(); setTimeout(refreshRecordBar, 50); } catch(e) {}
+    };
+  }
+  // Wrap saveStock
+  var _origSS = window.saveStock;
+  if (typeof _origSS === 'function') {
+    window.saveStock = function () {
+      _origSS.apply(this, arguments);
+      try { _triggerAutoSave(); setTimeout(refreshRecordBar, 50); } catch(e) {}
+    };
+  }
+  // Wrap confirmExpenses
+  var _origCE = window.confirmExpenses;
+  if (typeof _origCE === 'function') {
+    window.confirmExpenses = function () {
+      _origCE.apply(this, arguments);
+      try { _triggerAutoSave(); } catch(e) {}
+    };
+  }
+  // Wrap confirmTotalCash / confirmTotalBank
+  ['confirmTotalCash','confirmTotalBank'].forEach(function(fn) {
+    var orig = window[fn];
+    if (typeof orig === 'function') {
+      window[fn] = function () {
+        orig.apply(this, arguments);
+        try { _triggerAutoSave(); } catch(e) {}
+      };
+    }
+  });
+  // Wrap switchPage to refresh bar on record
+  var _origSP = window.switchPage;
+  if (typeof _origSP === 'function') {
+    window.switchPage = function (page) {
+      _origSP.apply(this, arguments);
+      if (page === 'record') {
+        setTimeout(function () {
+          try { refreshRecordBar(); refreshCarryBanner(); } catch(e) {}
+        }, 80);
+      }
+    };
+  }
+})();
+
+/* ── Init on load ─────────────────────────────────────────────────────── */
+document.addEventListener('DOMContentLoaded', function () {
+  setTimeout(function () {
+    try { refreshRecordBar(); } catch(e) {}
+    try { refreshCarryBanner(); } catch(e) {}
+  }, 300);
+});
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CURRENCY PICKER
+// ══════════════════════════════════════════════════════════════════════════════
+function _curUpdateSettingsRow(){
+  const k=GCFG.currency||'SAR';
+  const cur=CURRENCIES[k]||CURRENCIES.SAR;
+  const badge=document.getElementById('cfg-cur-badge');
+  const sub=document.getElementById('cfg-cur-sub');
+  if(badge) badge.textContent=cur.sym;
+  if(sub)   sub.textContent=cur.name;
+}
+
+function _currencyRefreshAll(){
+  try{refreshAllFinancials();}catch(e){}   // collections, cash ledger, all setEl calls
+  try{animateFinCards();}catch(e){}        // dashboard financial counters
+  try{refreshDashboard();}catch(e){}       // dashboard header re-renders
+  try{renderOwnerDashboard();}catch(e){}   // owner hero + stat cards
+  // Conditionally refresh open panels
+  try{if(document.getElementById('page-history')?.classList.contains('pg-active'))applyHistFilter();}catch(e){}
+  try{if(document.getElementById('ov-pnl')?.classList.contains('open'))renderPnL();}catch(e){}
+  try{if(document.getElementById('mr-ovl')?.classList.contains('open'))renderMeterReport();}catch(e){}
+}
+
+function openCurrencyPicker(){
+  const row=document.getElementById('cfg-currency-row');
+  if(!row) return;
+  // Toggle
+  const existing=document.getElementById('cur-inline-picker');
+  if(existing){ existing.remove(); row.classList.remove('cur-open'); return; }
+
+  const role=getRole();
+  const canChange=(role==='owner'||role==='super_owner');
+  const cur=(GCFG&&GCFG.currency)||'SAR';
+
+  const CUR_COLORS={
+    SAR:'#10b981',BDT:'#3b82f6',USD:'#16a34a',
+    EUR:'#7c3aed',GBP:'#d97706',INR:'#ef4444',AED:'#0891b2'
+  };
+
+  const wrap=document.createElement('div');
+  wrap.id='cur-inline-picker';
+  wrap.style.cssText='background:#fff;border-radius:0 0 14px 14px;overflow:hidden;box-shadow:0 4px 16px rgba(0,0,0,.08);';
+
+  Object.entries(CURRENCIES).forEach(function([key,c],idx,arr){
+    const isSel=key===cur;
+    const col=CUR_COLORS[key]||'#6366f1';
+    const isLast=idx===arr.length-1;
+
+    const item=document.createElement('div');
+    item.style.cssText=
+      'display:flex;align-items:center;gap:14px;padding:12px 16px;'+
+      'border-bottom:'+(isLast?'none':'1px solid #f3f4f6')+';'+
+      'background:'+(isSel?'rgba(99,102,241,.04)':'#fff')+';'+
+      (canChange?'cursor:pointer;':'')+
+      '-webkit-tap-highlight-color:transparent;';
+
+    // Icon circle
+    const ico=document.createElement('div');
+    ico.style.cssText=
+      'width:40px;height:40px;border-radius:12px;flex-shrink:0;'+
+      'display:flex;align-items:center;justify-content:center;'+
+      'font-size:20px;font-weight:700;'+
+      'background:'+(isSel?col:'#f4f6f8')+';color:'+(isSel?'#fff':col)+';';
+    ico.textContent=c.icon;
+
+    // Code + name
+    const info=document.createElement('div');
+    info.style.cssText='flex:1;min-width:0;';
+    const codeEl=document.createElement('div');
+    codeEl.style.cssText='font-size:14px;font-weight:700;letter-spacing:-.1px;line-height:1.3;color:'+(isSel?'#4f46e5':'#111827')+';';
+    codeEl.textContent=key;
+    const nameEl=document.createElement('div');
+    nameEl.style.cssText='font-size:11.5px;color:#9ca3af;line-height:1.3;margin-top:1px;';
+    nameEl.textContent=c.name;
+    info.append(codeEl,nameEl);
+
+    // Symbol + checkmark
+    const right=document.createElement('div');
+    right.style.cssText='display:flex;align-items:center;gap:10px;flex-shrink:0;';
+    const sym=document.createElement('span');
+    sym.style.cssText='font-size:13px;font-weight:700;color:'+(isSel?col:'#c4c9d4')+';min-width:26px;text-align:right;font-family:monospace;';
+    sym.textContent=c.sym;
+    const chk=document.createElement('div');
+    chk.style.cssText=
+      'width:22px;height:22px;border-radius:50%;flex-shrink:0;'+
+      'border:2px solid '+(isSel?'#6366f1':'#e2e8f0')+';'+
+      'background:'+(isSel?'#6366f1':'transparent')+';'+
+      'display:flex;align-items:center;justify-content:center;';
+    if(isSel) chk.innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" style="width:11px;height:11px"><polyline points="20 6 9 17 4 12"/></svg>';
+    right.append(sym,chk);
+
+    item.append(ico,info,right);
+
+    if(canChange){
+      item.addEventListener('pointerdown',function(){item.style.background='rgba(99,102,241,.08)';});
+      item.addEventListener('pointerup',function(){item.style.background=isSel?'rgba(99,102,241,.04)':'#fff';});
+      item.addEventListener('click',function(){
+        GCFG.currency=key;
+        try{persistGCFG();}catch(e){}
+        applyCurrency();
+        _curUpdateSettingsRow();
+        wrap.remove();
+        row.classList.remove('cur-open');
+        showToast(c.sym+' ('+key+') applied');
+        _currencyRefreshAll();
+      });
+    }
+    wrap.appendChild(item);
+  });
+
+  if(!canChange){
+    const note=document.createElement('div');
+    note.style.cssText='padding:9px 16px;font-size:11px;color:#94a3b8;text-align:center;border-top:1px solid #f3f4f6;';
+    note.textContent='View only — only owners can change currency';
+    wrap.appendChild(note);
+  }
+
+  row.parentNode.insertBefore(wrap, row.nextSibling);
+  row.classList.add('cur-open');
+}
+
+function closeCurrencyPicker(){
+  const p=document.getElementById('cur-inline-picker');
+  if(p) p.remove();
+  const r=document.getElementById('cfg-currency-row');
+  if(r) r.classList.remove('cur-open');
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   PetroBook i18n Engine — PB18n
+   v1.0 | EN / BN | Self-contained, zero dependencies
+   Storage key: pb-lang-v1 (global, not per-pump)
+   ══════════════════════════════════════════════════════════════════════ */
+
+</script>
+
+</body>
+</html>
