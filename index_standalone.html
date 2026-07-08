@@ -13718,8 +13718,15 @@ var PB_QueueReplayEngine = (function () {
 
   // ── Replay all pending operations in order ─────────────────────────────────
   // Called after navigator.onLine fires, or on app foreground.
+  // BUG-W8 FIX: Include 'failed' ops that haven't yet hit MAX_RETRIES.
+  // Previously replayAll only called getPendingOperations() which filters to
+  // status==='pending', so an op that failed once (status='failed', retries=1)
+  // was never retried again — stuck forever until manually cleared.
   function replayAll(firestoreWriter) {
-    var pending = QueueManager.getPendingOperations();
+    var pending = QueueManager.getAllOperations().filter(function(op) {
+      return op.status === 'pending' ||
+             (op.status === 'failed' && (op.retries || 0) < MAX_RETRIES);
+    });
     if (!pending.length) return Promise.resolve({ replayed: 0, dead: 0, retried: 0 });
     // Sequential replay preserves write order:
     // saveRecord before saveReport — carry-forward depends on it.
@@ -13804,6 +13811,39 @@ var PB_QueueReplayEngine = (function () {
     } catch (e) {
       console.warn('[QUEUE RECOVERY] cleanDeadWriteQueue error:', e);
     }
+
+    // BUG-W9 FIX: Also purge null-data entries from pb-sync-dead-v1 (QueueManager dead letter).
+    // cleanDeadWriteQueue previously only touched pb-firestore-write-queue-v1. Dead letter
+    // entries with data:null were accumulating indefinitely because no cleanup path existed.
+    // Safe to remove: data=null means no actual business data was ever captured.
+    try {
+      var deadRaw = localStorage.getItem(DEAD_KEY);
+      if (deadRaw) {
+        var deadArr = JSON.parse(deadRaw);
+        if (Array.isArray(deadArr)) {
+          var removedDead = 0;
+          var cleanedDead = deadArr.filter(function(e) {
+            if (e.data === null &&
+                (e.deadReason === 'writeDocument: path must be a non-empty string' ||
+                 (e.deadReason && e.deadReason.indexOf('Missing or insufficient permissions') !== -1) ||
+                 (e.deadReason && e.deadReason.indexOf('no_path') !== -1))) {
+              removedDead++;
+              return false;
+            }
+            return true;
+          });
+          if (removedDead > 0) {
+            localStorage.setItem(DEAD_KEY, JSON.stringify(cleanedDead));
+            console.log('[QUEUE RECOVERY] cleanDeadLetters removed ' + removedDead
+              + ' null-data entries from pb-sync-dead-v1, remaining=' + cleanedDead.length);
+            removed.deadLetter = removedDead;
+          }
+        }
+      }
+    } catch (e2) {
+      console.warn('[QUEUE RECOVERY] cleanDeadLetters error:', e2);
+    }
+
     return removed;
   }
 
@@ -40205,6 +40245,16 @@ function _pbInitStorage(){
                 console.info('[AUTH] TOKEN_CLAIMS='+JSON.stringify(claims));
                 var role = claims.role||'(no claim)';
                 var pumpId = claims.pumpId||'(none)';
+                // BUG-W10 DIAGNOSTIC: JWT custom claims are required for isOwner() in Firestore rules.
+                // If missing, writes to users/pumps/config will silently fail with PERMISSION_DENIED.
+                // Fix: re-run set-claims.js (GitHub Actions → set-custom-claims job) for this UID.
+                if (!claims.role) {
+                  console.warn(
+                    '[AUTH] MISSING JWT CLAIMS — isOwner() will fail in Firestore rules. ' +
+                    'Run the "set-custom-claims" GitHub Actions job for uid=' + fbUser.uid + '. ' +
+                    'Affected writes: users, pump metadata, pump config.'
+                  );
+                }
 
                 // Try userProfiles/{uid} first
                 return fsDb.doc('userProfiles/'+fbUser.uid).get().then(function(profDoc){
