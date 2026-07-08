@@ -5,7 +5,8 @@
  *
  * What it does (idempotent -- safe to re-run):
  *   1. Creates the super_owner Firebase Auth account if it doesn't exist
- *   2. Sets custom claims: { role, accountId, pumpId }
+ *   2. Looks up companyId from Firestore (company.ownerUid == uid)
+ *   3. Sets custom claims: { role, accountId, companyId, pumpId }
  *   3. Verifies claims by reading them back
  *
  * Auth:  Uses GOOGLE_APPLICATION_CREDENTIALS (set by google-github-actions/auth@v2)
@@ -19,7 +20,7 @@
 const admin = require('firebase-admin');
 
 // ── Config ─────────────────────────────────────────────────────────────────
-const SUPER_OWNER_EMAIL    = 'surafrustom@gmail.com';
+const SUPER_OWNER_EMAIL    = 'surafkhan8@gmail.com';
 const SUPER_OWNER_DISPLAY  = 'Super Owner';
 // Password shown once in CI logs -- change it after first login.
 const SUPER_OWNER_PASSWORD = 'PetroBook@2026!';
@@ -64,22 +65,39 @@ async function main() {
 
   const uid = userRecord.uid;
 
-  // 2. Set custom claims
+  // 2. Look up companyId from Firestore (company where ownerUid == uid)
+  const db = admin.firestore();
+  let companyId = null;
+  try {
+    const snap = await db.collection('companies').where('ownerUid', '==', uid).limit(1).get();
+    if (!snap.empty) {
+      companyId = snap.docs[0].id;
+      console.log('\nFound company:', companyId);
+    } else {
+      console.warn('\nWARN: No company found with ownerUid =', uid, '-- companyId will be null');
+    }
+  } catch (fsErr) {
+    console.warn('\nWARN: Firestore lookup failed:', fsErr.message, '-- companyId will be null');
+  }
+
+  // 3. Set custom claims
   const claims = {
     role:      'super_owner',
     accountId: uid,
+    companyId: companyId,
     pumpId:    null,
   };
 
   console.log('\nSetting custom claims:', JSON.stringify(claims));
   await admin.auth().setCustomUserClaims(uid, claims);
 
-  // 3. Verify by reading back
+  // 4. Verify by reading back
   const check   = await admin.auth().getUser(uid);
   const actual  = check.customClaims || {};
   const verified = (
     actual.role      === claims.role &&
     actual.accountId === claims.accountId &&
+    actual.companyId === claims.companyId &&
     actual.pumpId    === claims.pumpId
   );
 
@@ -96,6 +114,7 @@ async function main() {
   console.log('  super_owner UID  :', uid);
   console.log('  role             :', actual.role);
   console.log('  accountId        :', actual.accountId);
+  console.log('  companyId        :', actual.companyId);
   console.log('  pumpId           :', String(actual.pumpId));
   console.log('');
   console.log('  Login at: https://petrobook-prod.web.app');
