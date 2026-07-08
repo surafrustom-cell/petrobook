@@ -126,11 +126,20 @@ service cloud.firestore {
 
     // ── Company global config ────────────────────────────────────────────────
     // v3: isOwnerOf(cid) added — owner can load config even if member doc missing.
-    // ── Company global config ────────────────────────────────────────────────
-    // v5: Members can write config (saveCash) and lang (saveLang). noPassHash() blocks passHash.
+    // v6: Managers can write ONLY the three docs they legitimately update:
+    //   • activePump  — belt-and-suspenders; saveActivePump is deviceOnly:true so this
+    //                   should never actually be written by a manager, but permits replay
+    //                   of any historical queued entries without PERMISSION_DENIED.
+    //   • lang        — saveLang() sets the display language from manager shift UI.
+    //   • config      — saveCash/saveLang writes daily figures during manager shift.
+    //   All other global docs (e.g. settings, billing) remain owner-only.
     match /companies/{cid}/global/{doc} {
       allow read:  if isMemberOf(cid) || isOwnerOf(cid);
-      allow write: if (isMemberOf(cid) || isOwnerOf(cid)) && noPassHash();
+      allow write: if (isMemberOf(cid) || isOwnerOf(cid)) && noPassHash()
+                      && (isOwner()
+                          || doc == 'activePump'
+                          || doc == 'lang'
+                          || doc == 'config');
     }
 
     // ── Company pumps ────────────────────────────────────────────────────────
