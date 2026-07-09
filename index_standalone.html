@@ -15065,20 +15065,39 @@ var PB_RealtimeSync = (function () {
   var _listeners = {};  // { listenerKey: unsubscribeFn }
 
   // Listen to snapshot changes for a pump (owner dashboard live updates)
-  function listenToSnapshot(pumpId) {
-    // PHASE 5: Implement with Firestore onSnapshot listener.
-    //
-    // var unsub = _db.doc(PB_FIRESTORE_PATHS.snapshot(accountId, pumpId))
-    //   .onSnapshot(function(doc) {
-    //     if (!doc.exists) return;
-    //     var data = doc.data();
-    //     // Write to localStorage so getAllPumpTotals() picks it up
-    //     StorageService.saveStock(data, pumpId);
-    //     // Refresh owner dashboard if open
-    //     try { if(typeof renderOwnerDashboard === 'function') renderOwnerDashboard(); } catch(e) {}
-    //   });
-    // _listeners['snapshot_' + pumpId] = unsub;
-    return null;  // no-op
+  // RC#1 FIX: was a no-op stub; now registers a real Firestore onSnapshot listener.
+  // db and accountId are passed from _activateSyncEngine() which already holds both.
+  function listenToSnapshot(pumpId, db, accountId) {
+    var key = 'snapshot_' + pumpId;
+    if (_listeners[key]) return;  // already registered — skip duplicate
+    if (!db || !accountId || typeof PB_FIRESTORE_PATHS === 'undefined') {
+      console.warn('[RealtimeSync] listenToSnapshot skipped — missing db/accountId/paths');
+      return;
+    }
+    try {
+      var path = PB_FIRESTORE_PATHS.snapshot(accountId, pumpId);
+      var unsub = db.doc(path).onSnapshot(function(doc) {
+        if (!doc.exists) return;
+        var data = doc.data();
+        // Strip Firestore metadata then write DIRECTLY to localStorage.
+        // Bypassing StorageService avoids re-queuing the value back to Firestore
+        // and prevents a write→onSnapshot feedback loop.
+        var snap = Object.assign({}, data);
+        delete snap._syncedAt; delete snap._v;
+        var lsKey = pumpId === 'p1' ? 'pb-snap-v1' : 'pb-snap-v1__' + pumpId;
+        try { localStorage.setItem(lsKey, JSON.stringify(snap)); } catch(lsErr) {}
+        // Refresh owner dashboard so new values appear immediately.
+        try { if(typeof renderOwnerDashboard === 'function') renderOwnerDashboard(); } catch(e) {}
+        console.log('[RealtimeSync] snapshot updated — pumpId='+pumpId
+          +' cash='+(snap.cash||0)+' bank='+(snap.bank||0)+' stockVal='+(snap.stockVal||0));
+      }, function(err) {
+        console.warn('[RealtimeSync] onSnapshot error — pumpId='+pumpId+':', err.message||err);
+      });
+      _listeners[key] = unsub;
+      console.info('[RealtimeSync] listener registered — pumpId='+pumpId+' path='+path);
+    } catch(e) {
+      console.warn('[RealtimeSync] listenToSnapshot setup error:', e.message||e);
+    }
   }
 
   // Listen to ledger changes for the statement page
@@ -30498,6 +30517,17 @@ function _activateSyncEngine(fsDb, accountId){
       else PB_FirestoreWriter.setAccountId(accountId);
     }
     if(typeof PB_AuthBridge!=='undefined') PB_AuthBridge.activate();
+    // RC#1 FIX: Register Firestore onSnapshot listeners for every pump so this
+    // device receives updates written by any other device in real time.
+    if(typeof PB_RealtimeSync!=='undefined' && typeof getPumps==='function'){
+      try{
+        var _rsPumps=getPumps();
+        _rsPumps.forEach(function(p){ PB_RealtimeSync.listenToSnapshot(p.id, fsDb, accountId); });
+        console.info('[SYNC] listenToSnapshot registered for '+_rsPumps.length+' pump(s)');
+      }catch(e2){
+        console.warn('[SYNC] listenToSnapshot setup failed (non-fatal):',e2.message||e2);
+      }
+    }
     console.info('[SYNC] SyncEngine activated — accountId='+accountId);
   }catch(e){
     console.warn('[SYNC] _activateSyncEngine failed (non-fatal):',e.message||e);
@@ -37778,10 +37808,31 @@ function _pbLoadPumpData(pumps){
   return pumps.map(function(p){
     var snap;
     if(p.id===ACTIVE_PUMP && !window.PB_RESTORE_IN_PROGRESS){
-      // Normal mode: compute live totals from fresh in-memory state for active pump
+      // Normal mode: compute live totals from fresh in-memory state for active pump.
       const t=_liveTotals();
       snap={grand:Math.round(t.grand),cash:Math.round(t.cash),bank:Math.round(t.bank),sale:Math.round(t.sale),stockVal:Math.round(t.stockVal)};
-      console.log('[DATA SOURCE] RuntimeMemory — '+p.id+' (live totals)');
+      // RC#2 FIX: When sale=0, no readings have been entered this session, so
+      // _liveTotals() returns stale carry-forward values for cash/bank rather than
+      // the Firestore-confirmed values that _pbFinaliseRestore() wrote to pb-snap-v1.
+      // If a today-dated snapshot exists (from restore or the onSnapshot listener),
+      // use its cash/bank/stockVal instead.
+      // Once readings are entered (sale>0), _liveTotals() takes precedence again.
+      if(snap.sale===0){
+        var stored=readSnapshot(p.id);
+        if(stored && stored.date===_todayStr()){
+          snap.cash     = (stored.cash     != null) ? Math.round(stored.cash)     : snap.cash;
+          snap.bank     = (stored.bank     != null) ? Math.round(stored.bank)     : snap.bank;
+          snap.stockVal = (stored.stockVal != null) ? Math.round(stored.stockVal) : snap.stockVal;
+          snap.grand    = Math.round(snap.cash + snap.bank + snap.stockVal);
+          console.log('[DATA SOURCE] LocalStorage — '+p.id
+            +' (Firestore-restored cash/bank, sale=0)'
+            +' cash='+snap.cash+' bank='+snap.bank);
+        } else {
+          console.log('[DATA SOURCE] RuntimeMemory — '+p.id+' (live totals, no today snapshot)');
+        }
+      } else {
+        console.log('[DATA SOURCE] RuntimeMemory — '+p.id+' (live totals, sale='+snap.sale+')');
+      }
     } else {
       // During restore: use Firestore-restored snapshot for ALL pumps (avoids stale _liveTotals).
       // Also used for non-active pumps in normal mode (unchanged behaviour).
@@ -41080,72 +41131,4 @@ function openCurrencyPicker(){
     const info=document.createElement('div');
     info.style.cssText='flex:1;min-width:0;';
     const codeEl=document.createElement('div');
-    codeEl.style.cssText='font-size:14px;font-weight:700;letter-spacing:-.1px;line-height:1.3;color:'+(isSel?'#4f46e5':'#111827')+';';
-    codeEl.textContent=key;
-    const nameEl=document.createElement('div');
-    nameEl.style.cssText='font-size:11.5px;color:#9ca3af;line-height:1.3;margin-top:1px;';
-    nameEl.textContent=c.name;
-    info.append(codeEl,nameEl);
-
-    // Symbol + checkmark
-    const right=document.createElement('div');
-    right.style.cssText='display:flex;align-items:center;gap:10px;flex-shrink:0;';
-    const sym=document.createElement('span');
-    sym.style.cssText='font-size:13px;font-weight:700;color:'+(isSel?col:'#c4c9d4')+';min-width:26px;text-align:right;font-family:monospace;';
-    sym.textContent=c.sym;
-    const chk=document.createElement('div');
-    chk.style.cssText=
-      'width:22px;height:22px;border-radius:50%;flex-shrink:0;'+
-      'border:2px solid '+(isSel?'#6366f1':'#e2e8f0')+';'+
-      'background:'+(isSel?'#6366f1':'transparent')+';'+
-      'display:flex;align-items:center;justify-content:center;';
-    if(isSel) chk.innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" style="width:11px;height:11px"><polyline points="20 6 9 17 4 12"/></svg>';
-    right.append(sym,chk);
-
-    item.append(ico,info,right);
-
-    if(canChange){
-      item.addEventListener('pointerdown',function(){item.style.background='rgba(99,102,241,.08)';});
-      item.addEventListener('pointerup',function(){item.style.background=isSel?'rgba(99,102,241,.04)':'#fff';});
-      item.addEventListener('click',function(){
-        GCFG.currency=key;
-        try{persistGCFG();}catch(e){}
-        applyCurrency();
-        _curUpdateSettingsRow();
-        wrap.remove();
-        row.classList.remove('cur-open');
-        showToast(c.sym+' ('+key+') applied');
-        _currencyRefreshAll();
-      });
-    }
-    wrap.appendChild(item);
-  });
-
-  if(!canChange){
-    const note=document.createElement('div');
-    note.style.cssText='padding:9px 16px;font-size:11px;color:#94a3b8;text-align:center;border-top:1px solid #f3f4f6;';
-    note.textContent='View only — only owners can change currency';
-    wrap.appendChild(note);
-  }
-
-  row.parentNode.insertBefore(wrap, row.nextSibling);
-  row.classList.add('cur-open');
-}
-
-function closeCurrencyPicker(){
-  const p=document.getElementById('cur-inline-picker');
-  if(p) p.remove();
-  const r=document.getElementById('cfg-currency-row');
-  if(r) r.classList.remove('cur-open');
-}
-
-/* ══════════════════════════════════════════════════════════════════════
-   PetroBook i18n Engine — PB18n
-   v1.0 | EN / BN | Self-contained, zero dependencies
-   Storage key: pb-lang-v1 (global, not per-pump)
-   ══════════════════════════════════════════════════════════════════════ */
-
-</script>
-
-</body>
-</html>
+    code
