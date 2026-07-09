@@ -15086,8 +15086,6 @@ var PB_RealtimeSync = (function () {
         delete snap._syncedAt; delete snap._v;
         var lsKey = pumpId === 'p1' ? 'pb-snap-v1' : 'pb-snap-v1__' + pumpId;
         try { localStorage.setItem(lsKey, JSON.stringify(snap)); } catch(lsErr) {}
-        // Refresh owner dashboard so new values appear immediately.
-        try { if(typeof renderOwnerDashboard === 'function') renderOwnerDashboard(); } catch(e) {}
         console.log('[RealtimeSync] snapshot updated — pumpId='+pumpId
           +' cash='+(snap.cash||0)+' bank='+(snap.bank||0)+' stockVal='+(snap.stockVal||0));
       }, function(err) {
@@ -37817,7 +37815,7 @@ function _pbLoadPumpData(pumps){
       // If a today-dated snapshot exists (from restore or the onSnapshot listener),
       // use its cash/bank/stockVal instead.
       // Once readings are entered (sale>0), _liveTotals() takes precedence again.
-      if(snap.sale===0){
+      if(snap.sale===0 && totalCashConfirmed==null){
         var stored=readSnapshot(p.id);
         if(stored && stored.date===_todayStr()){
           snap.cash     = (stored.cash     != null) ? Math.round(stored.cash)     : snap.cash;
@@ -37825,13 +37823,14 @@ function _pbLoadPumpData(pumps){
           snap.stockVal = (stored.stockVal != null) ? Math.round(stored.stockVal) : snap.stockVal;
           snap.grand    = Math.round(snap.cash + snap.bank + snap.stockVal);
           console.log('[DATA SOURCE] LocalStorage — '+p.id
-            +' (Firestore-restored cash/bank, sale=0)'
+            +' (snapshot fallback: sale=0 totalCashConfirmed=null)'
             +' cash='+snap.cash+' bank='+snap.bank);
         } else {
           console.log('[DATA SOURCE] RuntimeMemory — '+p.id+' (live totals, no today snapshot)');
         }
       } else {
-        console.log('[DATA SOURCE] RuntimeMemory — '+p.id+' (live totals, sale='+snap.sale+')');
+        console.log('[DATA SOURCE] RuntimeMemory — '+p.id
+          +' (live totals, sale='+snap.sale+' totalCashConfirmed='+(totalCashConfirmed==null?'null':totalCashConfirmed)+')');
       }
     } else {
       // During restore: use Firestore-restored snapshot for ALL pumps (avoids stale _liveTotals).
@@ -41131,4 +41130,4 @@ function openCurrencyPicker(){
     const info=document.createElement('div');
     info.style.cssText='flex:1;min-width:0;';
     const codeEl=document.createElement('div');
-    code
+    codeEl.style.cssText='font-size:14px;font-we
